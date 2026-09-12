@@ -1,0 +1,38 @@
+# ---- 构建产物 / Build artifacts ----
+build/
+dist/
+*.spec.bak
+*.manifest
+
+# ---- Python / 字节码 ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# ---- 运行时与模型数据（体积大，一律不入库）----
+# Runtime & model data — never commit
+models/
+runtime/
+weights/
+hf_modules/
+.pipcache/
+
+# ---- 下载/运行日志 ----
+*.log
+
+# ---- 测试图片（含打标产生的 labels）----
+test_images/
+
+# ---- 第三方源码目录（如本地克隆的 ultralytics）----
+ultralytics/
+
+# ---- IDE / 编辑器 ----
+.vscode/
+.idea/
+
+# ---- 操作系统 ----
+Thumbs.db
+desktop.ini
+.DS_Store

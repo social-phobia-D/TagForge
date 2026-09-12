@@ -1,0 +1,226 @@
+import os
+import re
+
+from app.engines.base import EngineBase, EngineResult
+from app.engines.base import Box
+
+MODEL_ID = "nvidia/LocateAnything-3B"
+
+
+class LocateAnythingEngine(EngineBase):
+    key = "locateanything"
+    title = "LocateAnything-3B 全自动物体标签 (NVIDIA)"
+    description = "英伟达 3B 开放词表检测模型（并行出框解码）：可填类名做检测，也可免提示词自动找物体，输出物体标签+检测框。实测 int4 峰值显存约 5.5GB、单张约 3 秒。"
+    vram_note = "int4 量化峰值约 5.5GB 显存；12GB+ 显卡可跑原精度更快"
+    pip_deps = ["torch", "transformers", "accelerate", "bitsandbytes", "einops", "safetensors", "peft", "eva-decord", "lmdb"]
+    import_deps = ["torch", "transformers", "accelerate", "bitsandbytes", "einops", "safetensors", "peft", "decord", "lmdb"]
+    weights_size = "约 7 GB"
+    need_torch = True
+    has_boxes = True
+    weight_urls = [f"https://hf-mirror.com/{MODEL_ID}", f"https://huggingface.co/{MODEL_ID}"]
+    custom_hint = "选 LocateAnything-3B 模型文件夹（含 config.json）"
+
+    def _cache_dir(self) -> str:
+        return os.path.join(self.models_dir(), "locateanything")
+
+    def weights_ready(self) -> bool:
+        cw = self.custom_weights()
+        if cw:
+            return os.path.isfile(os.path.join(cw, "config.json"))
+        d = self._cache_dir()
+        return os.path.isdir(d) and any(
+            x.startswith("models--nvidia--LocateAnything-3B") for x in os.listdir(d))
+
+    def _download_impl(self, models_dir: str, log_cb=None):
+        import huggingface_hub
+        if log_cb:
+            log_cb(f"LocateAnything-3B: 下载 {MODEL_ID}（{self.weights_size}，需要较长时间）...")
+        huggingface_hub.snapshot_download(MODEL_ID, cache_dir=self._cache_dir())
+
+    def _load_impl(self, models_dir: str, params: dict, log_cb=None):
+        from app.engines._tcompat import patch_legacy_generation_attrs
+        patch_legacy_generation_attrs()
+        import importlib
+        if log_cb:
+            log_cb("LocateAnything-3B: 导入 torch/transformers（首次约 10-20 秒）...")
+        torch = importlib.import_module("torch")
+        transformers = importlib.import_module("transformers")
+        self.torch = torch
+
+        cw = (params or {}).get("custom_weights") or self.custom_weights()
+        src = cw or MODEL_ID
+        kw = {} if cw else {"cache_dir": self._cache_dir()}
+
+        from app.core.gpu_check import gpu_info, pick_precision
+        _name, vram = gpu_info()
+        cuda = torch.cuda.is_available()
+        preferred = pick_precision(vram) if cuda else "cpu"
+        order = [preferred] + [p for p in ("fp16", "int4", "cpu") if p != preferred]
+
+        last_err = None
+        self.device = "cpu"
+        for prec in order:
+            if prec != "cpu" and not cuda:
+                continue
+            try:
+                if log_cb:
+                    log_cb(f"LocateAnything-3B: 尝试以 {prec} 加载 ...")
+                if prec == "int4":
+                    from transformers import BitsAndBytesConfig
+                    self.model = transformers.AutoModel.from_pretrained(
+                        src, trust_remote_code=True, **kw,
+                        attn_implementation="sdpa",
+                        quantization_config=BitsAndBytesConfig(
+                            load_in_4bit=True,
+                            bnb_4bit_compute_dtype=torch.float16,
+                            bnb_4bit_quant_type="nf4"),
+                        device_map={"": 0})
+                    self.device = "cuda"
+                    self.dtype = torch.float16
+                elif prec == "fp16":
+                    self.model = transformers.AutoModel.from_pretrained(
+                        src, trust_remote_code=True, **kw,
+                        attn_implementation="sdpa",
+                        torch_dtype=torch.bfloat16).to("cuda").eval()
+                    self.device = "cuda"
+                    self.dtype = torch.bfloat16
+                else:
+                    self.model = transformers.AutoModel.from_pretrained(
+                        src, trust_remote_code=True, **kw,
+                        attn_implementation="eager",
+                        torch_dtype=torch.float32).to("cpu").eval()
+                    self.device = "cpu"
+                    self.dtype = torch.float32
+                # 远程代码内部 Qwen2 fork 只实现了 sdpa/flash，
+                # attn_implementation 参数不会传到内部子模块，需手动补齐
+                for m in self.model.modules():
+                    cfg = getattr(m, "config", None)
+                    if cfg is not None and hasattr(cfg, "_attn_implementation"):
+                        cfg._attn_implementation = "sdpa"
+                    if hasattr(m, "_attn_implementation"):
+                        m._attn_implementation = "sdpa"
+                self.precision = prec
+                break
+            except Exception as e:
+                last_err = e
+                if log_cb:
+                    log_cb(f"LocateAnything-3B: {prec} 加载失败（{e}），尝试降级 ...")
+                self.model = None
+        else:
+            raise RuntimeError(f"LocateAnything-3B 所有加载方式均失败: {last_err}")
+
+        self.tokenizer = transformers.AutoTokenizer.from_pretrained(
+            src, trust_remote_code=True, **kw)
+        self.processor = transformers.AutoProcessor.from_pretrained(
+            src, trust_remote_code=True, **kw)
+        if log_cb:
+            log_cb(f"LocateAnything-3B: 加载完成（{self.precision}）")
+
+    def _unload_impl(self):
+        self.model = None
+        self.processor = None
+        self.tokenizer = None
+        try:
+            self.torch.cuda.empty_cache()
+        except Exception:
+            pass
+
+    def _predict(self, img, prompt: str, generation_mode: str = "hybrid",
+                 max_new_tokens: int = 512) -> str:
+        messages = [
+            {"role": "user", "content": [
+                {"type": "image", "image": img},
+                {"type": "text", "text": prompt},
+            ]}
+        ]
+        text = self.processor.py_apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True)
+        images, videos = self.processor.process_vision_info(messages)
+        inputs = self.processor(
+            text=[text], images=images, videos=videos,
+            return_tensors="pt").to(self.device)
+        pixel_values = inputs["pixel_values"].to(self.dtype)
+        try:
+            response = self.model.generate(
+                pixel_values=pixel_values,
+                input_ids=inputs["input_ids"],
+                attention_mask=inputs["attention_mask"],
+                image_grid_hws=inputs.get("image_grid_hws", None),
+                tokenizer=self.tokenizer,
+                max_new_tokens=max_new_tokens,
+                use_cache=True,
+                generation_mode=generation_mode,
+                # 官方 worker 默认采样参数：greedy 会让模型死循环重复同一个框
+                temperature=0.7,
+                top_p=0.9,
+                repetition_penalty=1.1,
+            )
+        except (TypeError, KeyError):
+            # 远程代码签名可能不同，退回最小参数
+            response = self.model.generate(
+                pixel_values=pixel_values,
+                input_ids=inputs["input_ids"],
+                attention_mask=inputs["attention_mask"],
+                tokenizer=self.tokenizer,
+                max_new_tokens=max_new_tokens,
+                use_cache=True,
+            )
+        answer = response[0] if isinstance(response, tuple) else response
+        if isinstance(answer, list):
+            answer = answer[0]
+        if hasattr(answer, "strip"):
+            return answer
+        return self.tokenizer.batch_decode(
+            [answer], skip_special_tokens=True)[0]
+
+    def _tag_impl(self, path: str, params: dict) -> EngineResult:
+        from PIL import Image
+        img = Image.open(path).convert("RGB")
+        w, h = img.size
+
+        cats = [c.strip() for c in str(params.get("classes", "")).split(",") if c.strip()]
+        custom = str(params.get("prompt") or "").strip()
+        if custom:
+            prompt = custom
+        elif cats:
+            prompt = ("Locate all the instances that matches the following "
+                      f"description: {'</c>'.join(cats)}.")
+        else:
+            prompt = "Detect all the objects in box format."
+        mode = str(params.get("generation_mode") or "hybrid")
+        mnt = int(params.get("max_new_tokens") or 512)
+
+        answer = self._predict(img, prompt, generation_mode=mode,
+                               max_new_tokens=mnt)
+        result = EngineResult()
+
+        # 官方格式: <ref>标签</ref><box><x1><y1><x2><y2></box>，坐标 0-1000 归一化，
+        # 一个 ref 后可跟多个 box；无物体时输出 <none>
+        token_re = re.compile(
+            r"<ref>(.*?)</ref>|<box><(\d+)><(\d+)><(\d+)><(\d+)></box>")
+        current = ""
+        for m in token_re.finditer(answer):
+            if m.group(1) is not None:
+                current = m.group(1).strip()
+                continue
+            x1, y1, x2, y2 = [int(m.group(i)) for i in range(2, 6)]
+            label = current or (cats[0] if cats else "object")
+            if label and label not in result.tags:
+                result.tags.append(label)
+            result.boxes.append(Box(
+                label=label, conf=1.0,
+                x1=x1 / 1000.0 * w, y1=y1 / 1000.0 * h,
+                x2=x2 / 1000.0 * w, y2=y2 / 1000.0 * h))
+
+        if not result.boxes:
+            if "<none>" in answer:
+                return result  # 模型明确说没找到物体
+            # 兜底：无结构化输出时把文本当标签
+            text = re.sub(r"<[^>]*>", " ", answer).strip()
+            if text:
+                result.tags.append(text[:200])
+        elif cats:
+            for c in cats:
+                if c not in result.tags:
+                    result.tags.append(c)
+        return result
