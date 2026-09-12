@@ -61,6 +61,7 @@ class MainWindow(QMainWindow):
         self.batch = None
         self._load_worker = None
         self._pending_loads = []
+        self._cancelling = False
         self._paths_to_tag = []
         self._thumb_items = {}
         self.engine_rows = {}
@@ -901,6 +902,7 @@ class MainWindow(QMainWindow):
 
         self._paths_to_tag = paths
         self._tagging_engines = engines
+        self._cancelling = False
         to_load = [e for e in engines if not e.loaded]
         self._set_busy_tagging(True, tr("准备模型…"))
         if to_load:
@@ -924,6 +926,11 @@ class MainWindow(QMainWindow):
     def _on_load_done(self, ok, msg):
         if self._pending_loads:
             self._pending_loads.pop(0)
+        if self._cancelling:
+            # 取消发生在"准备模型…"阶段：UI 已在 _cancel_batch 里恢复，这里只收尾
+            self._cancelling = False
+            self._pending_loads = []
+            return
         if not ok:
             self._log(tr("加载失败: {0}").format(msg))
             self.status_msg.setText(tr("加载失败: {0}").format(msg))
@@ -970,9 +977,27 @@ class MainWindow(QMainWindow):
         self.status_msg.setText(tr("{0}: 成功 {1}, 失败 {2}").format(msg, ok, fail))
 
     def _cancel_batch(self):
+        """取消打标。两个阶段都要能打断：
+        打标中 → BatchWorker.stop()（内部 abort sidecar，秒回）；
+        准备模型中 → abort 正在加载的引擎（可能卡在首次下 CLIP / 7GB 权重）。"""
         if self.batch and self.batch.isRunning():
             self.batch.stop()
             self.status_msg.setText(tr("正在取消…"))
+            return
+        if self._load_worker and self._load_worker.isRunning():
+            self._cancelling = True
+            for eng in list(self._pending_loads):
+                try:
+                    eng.abort()
+                except Exception:
+                    pass
+            self._pending_loads = []
+            self._set_busy_tagging(False)
+            self._log(tr("已取消"))
+            self.status_msg.setText(tr("已取消"))
+            return
+        if self.batch and self.batch.isRunning():  # 加载刚结束的竞态，顺手停掉
+            self.batch.stop()
 
     def _set_busy_tagging(self, busy, label=None):
         self.btn_tag_one.setEnabled(not busy)

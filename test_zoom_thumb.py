@@ -185,6 +185,35 @@ q.setValue("weights/wd14", "")
 q.setValue("weights/yoloworld", "")
 assert we.custom_weights() == "" and ye.custom_weights() == "", "清除应生效"
 
+# ---- 5. 取消能打断在途推理（曾经点了取消没反应）----
+from app.core.batch_worker import BatchWorker
+
+
+class _FakeEngine:
+    """记录 abort 是否被调用；tag_image 模拟一次"永不返回"的推理"""
+    key = "fake"
+    title = "假引擎"
+
+    def __init__(self):
+        self.aborted = False
+
+    def abort(self):
+        self.aborted = True
+
+    def tag_image(self, path, params):
+        raise RuntimeError("已取消")
+
+
+fe = _FakeEngine()
+bw = BatchWorker(None, [fe], ["x.jpg"], {}, "replace", "", "")
+bw.stop()
+assert fe.aborted is True, "取消必须 abort 引擎（否则要等在途请求跑完/超时）"
+
+# 引擎无 sidecar 时 abort 不应炸，且要复位加载状态
+ye._loaded = True
+ye.abort()
+assert ye._loaded is False, "abort 后应视为未加载"
+
 # ---- 清理 ----
 st.set_last_dir(old_dir)
 os.remove(IMG)

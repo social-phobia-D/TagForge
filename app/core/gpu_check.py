@@ -1,6 +1,9 @@
+import os
 import shutil
 import subprocess
 
+# console=False 打包下不加这项，nvidia-smi 会闪一个黑色 cmd 窗口
+CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
 
 _GPU_CACHE = None
 
@@ -17,6 +20,7 @@ def gpu_info() -> tuple:
             out = subprocess.run(
                 ["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader,nounits"],
                 capture_output=True, text=True, timeout=10,
+                creationflags=CREATE_NO_WINDOW,
             )
             line = out.stdout.strip().splitlines()[0]
             name, mb = line.split(",")[0].strip(), int(line.split(",")[1].strip())

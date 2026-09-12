@@ -398,12 +398,25 @@ class SidecarProcess:
         self.is_loaded = False
         self._event = threading.Event()
         self._reply = None
+        self._exited = False
         from app.engines.base import get_data_root
+        # worker 的 stderr 走文件：console=False 打包下无处可显示，而库的进度
+        # （下载 CLIP、tqdm）与崩溃 traceback 全在这里，丢弃就等于瞎排障。
+        log_path = os.path.join(get_data_root(), "logs", f"sidecar-{engine.key}.log")
+        os.makedirs(os.path.dirname(log_path), exist_ok=True)
+        if os.path.exists(log_path) and os.path.getsize(log_path) > 5 * 1024 * 1024:
+            try:  # 库的进度条很吵，只留上一份，防止无限增长
+                os.replace(log_path, log_path + ".1")
+            except OSError:
+                pass
+        self._err_fh = open(log_path, "a", encoding="utf-8", errors="replace")
         self.proc = subprocess.Popen(
             [current_python(engine), worker_script(), engine.key],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL, text=True, encoding="utf-8", bufsize=1,
+            stderr=self._err_fh, text=True, encoding="utf-8", bufsize=1,
             cwd=os.path.dirname(worker_script()),
+            # 不加这项，打包版(console=False)每起一个 sidecar 就弹一个黑色 cmd 窗口
+            creationflags=CREATE_NO_WINDOW,
             env={**os.environ, "PYTHONIOENCODING": "utf-8",
                  # worker 是外部 Python（sys.frozen=False），必须显式钉住数据根，
                  # 否则 get_data_root() 算出 _MEIPASS，权重会下进安装目录
@@ -441,8 +454,31 @@ class SidecarProcess:
                     self._event.set()
         except Exception:
             pass
+        finally:
+            # 子进程退出（崩溃/被杀）：必须唤醒等待方，否则在途请求要干等满
+            # SIDECAR_TIMEOUT(600s) —— 表现就是"卡死且取消无反应"。
+            self._exited = True
+            if not self._event.is_set():
+                self._reply = {"type": "error",
+                               "msg": f"sidecar 进程已退出（详见 logs/sidecar-{self.engine_key}.log）"}
+                self._event.set()
+
+    def abort(self):
+        """取消打标：杀掉子进程并立即唤醒在途请求，不等超时。"""
+        if self.proc is not None and self.proc.poll() is None:
+            try:
+                self.proc.kill()
+            except Exception:
+                pass
+        self._exited = True
+        if not self._event.is_set():
+            self._reply = {"type": "error", "msg": "已取消"}
+            self._event.set()
+        self.is_loaded = False
 
     def _request(self, payload: dict, timeout: float = SIDECAR_TIMEOUT):
+        if self._exited:
+            raise RuntimeError("sidecar 进程已退出")
         if not self.alive:
             raise RuntimeError("sidecar 进程未运行")
         self._event.clear()
@@ -477,17 +513,22 @@ class SidecarProcess:
         return self._request({"op": "tag", "path": path, "params": params})["data"]
 
     def close(self):
-        try:
-            self._request({"op": "exit"}, timeout=10)
-        except Exception:
-            pass
-        try:
-            self.proc.stdin.close()
-        except Exception:
-            pass
-        try:
-            self.proc.terminate()
-            self.proc.wait(timeout=5)  # 不 wait 会短暂留僵尸进程
-        except Exception:
-            pass
+        if self.proc is not None:
+            try:
+                self._request({"op": "exit"}, timeout=10)
+            except Exception:
+                pass
+            try:
+                self.proc.stdin.close()
+            except Exception:
+                pass
+            try:
+                self.proc.terminate()
+                self.proc.wait(timeout=5)  # 不 wait 会短暂留僵尸进程
+            except Exception:
+                pass
         self.proc = None
+        try:
+            self._err_fh.close()
+        except Exception:
+            pass

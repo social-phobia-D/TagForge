@@ -178,6 +178,17 @@ class EngineBase:
         self._load_impl(get_models_dir(), params, log_cb)
         self._loaded = True
 
+    def abort(self):
+        """打断在途推理（取消打标 / 关窗用）。sidecar 引擎直接杀进程并唤醒
+        等待方；进程内引擎（WD14）无法中断当前这一张。"""
+        if self._sidecar:
+            try:
+                self._sidecar.abort()
+            except Exception:
+                pass
+            self._sidecar = None
+        self._loaded = False
+
     def unload(self):
         if self.use_sidecar():
             if self._sidecar:

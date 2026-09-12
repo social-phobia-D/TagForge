@@ -22,9 +22,15 @@ def main():
     if pkg_parent not in sys.path:
         sys.path.append(pkg_parent)
 
+    # 协议通道隔离：ultralytics/tqdm/transformers 都会往 stdout 打印，一旦与
+    # JSON 回复拼进同一行，父进程就解析不到回复 → 干等满超时（表现为卡死）。
+    # 协议只走这个原始句柄，其余 print 一律改道 stderr（落到 sidecar-*.log）。
+    proto = sys.stdout
+    sys.stdout = sys.stderr
+
     def send(obj):
-        sys.stdout.write(json.dumps(obj, ensure_ascii=False) + "\n")
-        sys.stdout.flush()
+        proto.write(json.dumps(obj, ensure_ascii=False) + "\n")
+        proto.flush()
 
     def log(msg):
         send({"type": "log", "msg": msg})

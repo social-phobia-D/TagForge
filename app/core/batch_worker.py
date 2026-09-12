@@ -46,6 +46,13 @@ class BatchWorker(QThread):
 
     def stop(self):
         self._stop = True
+        # 只置标志位的话，取消要等当前这张跑完才生效；sidecar 引擎可能正卡在
+        # 一次长推理/首次下载里（数分钟），表现就是"点了取消没反应"。
+        for eng in self.engines:
+            try:
+                eng.abort()
+            except Exception:
+                pass
 
     def run(self):
         try:
@@ -63,7 +70,10 @@ class BatchWorker(QThread):
                         self._merge(item, res, eng.key)
                         path_ok = True
                     except Exception as e:
-                        self.failed_one.emit(path, f"{eng.title}: {e}")
+                        if not self._stop:  # 取消导致的报错不算失败，别刷日志
+                            self.failed_one.emit(path, f"{eng.title}: {e}")
+                if self._stop:
+                    break
                 if path_ok:
                     self.ok += 1
                 else:
