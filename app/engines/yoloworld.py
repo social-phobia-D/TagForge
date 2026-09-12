@@ -71,8 +71,43 @@ class YoloWorldEngine(EngineBase):
         except Exception:
             self.device = "cpu"
         self._last_classes = None
+        # 预热：第一次 set_classes 会按需拉 CLIP 文本编码器（约 338MB）。
+        # 放在加载阶段并给出提示，否则用户第一次推理时界面毫无动静，
+        # 看起来就是"卡死"（实际在下模型）。
+        if log_cb:
+            log_cb("YOLO-World: 准备文本编码器（首次需下载约 338MB CLIP，可能数分钟）...")
+        try:
+            self._apply_classes(["person"])
+        except Exception as e:
+            if log_cb:
+                log_cb(f"YOLO-World: 文本编码器预热失败，首次推理时重试: {e}")
+        self._last_classes = None
         if log_cb:
             log_cb(f"YOLO-World: 就绪 ({'GPU' if self.device == 0 else 'CPU'})")
+
+    def _apply_classes(self, vocab: list):
+        """设置词表，并把文本编码器与文本特征对齐到模型设备。
+
+        坑：predict() 里 model.to(cuda) 会顺带把 CLIP 子模块搬到 CUDA，但
+        CLIP 自己的 .device 属性还写着 CPU，于是下一次 set_classes 把 token
+        生成到 CPU、embedding 权重在 CUDA → 报
+        "Expected all tensors to be on the same device ..."（第二张图/换词表必炸）。
+        文本特征 txt_feats 同理，必须跟着设备走。"""
+        try:
+            import torch
+            dev = torch.device("cuda:0") if self.device == 0 else torch.device("cpu")
+            tm = getattr(self.model.model, "clip_model", None)
+            if tm is not None:
+                tm.to(dev)
+                tm.device = dev  # tokenize() 按这个属性决定 token 放哪
+        except Exception:
+            pass
+        self.model.set_classes(vocab)
+        self._last_classes = vocab
+        try:
+            self.model.model.txt_feats = self.model.model.txt_feats.to(dev)
+        except Exception:
+            pass
 
     def _unload_impl(self):
         self.model = None
@@ -83,8 +118,7 @@ class YoloWorldEngine(EngineBase):
         if not vocab:
             return result
         if vocab != self._last_classes:
-            self.model.set_classes(vocab)
-            self._last_classes = vocab
+            self._apply_classes(vocab)
         r = self.model.predict(path, conf=float(params.get("conf", 0.25)),
                                device=self.device, verbose=False)[0]
         seen = set()
