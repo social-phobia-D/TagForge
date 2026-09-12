@@ -36,3 +36,10 @@ ultralytics/
 Thumbs.db
 desktop.ini
 .DS_Store
+
+# ---- 本地测试数据 / 分发包 / 工具目录 ----
+test_dataset/
+yolo_test/
+thumb_cache/
+TagForge_*.zip
+.workbuddy/
