@@ -174,16 +174,17 @@ def app_root_for_worker() -> str:
         os.path.abspath(__file__))))
 
 
-def download_file(url: str, dest: str, log_cb=None, timeout: int = 30):
+def download_file(url: str, dest: str, log_cb=None, timeout: int = 30,
+                  progress_cb=None):
     """公开的分块下载（带超时），供各引擎下载权重复用"""
-    _download(url, dest, log_cb, timeout)
+    _download(url, dest, log_cb, timeout, progress_cb=progress_cb)
 
 
 def _download(url: str, dest: str, log_cb=None, timeout: int = 30,
-              attempts: int = 6):
+              attempts: int = 6, progress_cb=None):
     """分块下载：断点续传 + 自动重试。网络差/限速时单次请求会超时中断，
     用 Range 从 .part 已有字节继续；先写 .part 再改名，失败不残留半截
-    文件被误判为权重已就绪。"""
+    文件被误判为权重已就绪。有 Content-Length 时回报真实字节百分比。"""
     if log_cb:
         log_cb(f"下载 {url} ...")
     d = os.path.dirname(dest)
@@ -200,19 +201,38 @@ def _download(url: str, dest: str, log_cb=None, timeout: int = 30,
             req = urllib.request.Request(url, headers=headers)
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 mode = "ab" if (have and resp.status == 206) else "wb"
+                if mode == "wb":
+                    have = 0
+                total = _content_length(resp, have)
+                written = have
+                last_pct = -10
+                logged_pct = -10
                 with open(tmp, mode) as f:
                     while True:
                         chunk = resp.read(1 << 20)
                         if not chunk:
                             break
                         f.write(chunk)
+                        written += len(chunk)
+                        if total:
+                            pct = min(99, int(written * 100 / total))
+                            if progress_cb and pct - last_pct >= 1:
+                                last_pct = pct
+                                progress_cb(pct)
+                            if log_cb and pct // 10 > logged_pct // 10:
+                                logged_pct = pct
+                                log_cb(f"  下载中 {pct}%")
             os.replace(tmp, dest)
+            if progress_cb:
+                progress_cb(100)
             return
         except urllib.error.HTTPError as e:
             last = e
             if e.code == 416 and os.path.exists(tmp) \
                     and os.path.getsize(tmp) > 0:
                 os.replace(tmp, dest)  # 已下载完成（Range 超出总长）
+                if progress_cb:
+                    progress_cb(100)
                 return
         except Exception as e:
             last = e
@@ -224,6 +244,23 @@ def _download(url: str, dest: str, log_cb=None, timeout: int = 30,
     except OSError:
         pass
     raise last
+
+
+def _content_length(resp, have: int):
+    """本次响应的目标总字节数（含断点续传前已有的部分），拿不到就返回 None"""
+    cr = resp.headers.get("Content-Range")
+    if cr and "/" in cr:
+        try:
+            return int(cr.rsplit("/", 1)[1])
+        except ValueError:
+            pass
+    cl = resp.headers.get("Content-Length")
+    if cl:
+        try:
+            return int(cl) + have
+        except ValueError:
+            pass
+    return None
 
 
 def _has_nvidia() -> bool:
@@ -395,6 +432,9 @@ class SidecarProcess:
     def __init__(self, engine, log_cb=None):
         self.engine_key = engine.key
         self.log_cb = log_cb
+        # 当前请求的进度回调（0-100）。注意它由 _read_loop 线程调用，
+        # 上层传进来的必须是 Qt 信号 emit（跨线程排队）之类的线程安全函数。
+        self.progress_cb = None
         self.is_loaded = False
         self._event = threading.Event()
         self._reply = None
@@ -446,6 +486,12 @@ class SidecarProcess:
                 if t == "log":
                     if self.log_cb:
                         self.log_cb(msg.get("msg", ""))
+                elif t == "progress":
+                    if self.progress_cb:
+                        try:
+                            self.progress_cb(int(msg.get("value", 0)))
+                        except Exception:
+                            pass
                 elif t == "error":
                     self._reply = {"type": "error", "msg": msg.get("msg", "")}
                     self._event.set()
@@ -500,16 +546,19 @@ class SidecarProcess:
             raise RuntimeError(reply.get("msg", "sidecar 错误"))
         return reply
 
-    def download(self):
+    def download(self, progress_cb=None):
+        self.progress_cb = progress_cb
         self._request({"op": "download"})
 
-    def load(self, params: dict):
+    def load(self, params: dict, progress_cb=None):
         from app.engines.base import get_models_dir
+        self.progress_cb = progress_cb
         self._request({"op": "load", "models_dir": get_models_dir(),
                        "params": params})
         self.is_loaded = True
 
-    def tag(self, path: str, params: dict) -> dict:
+    def tag(self, path: str, params: dict, progress_cb=None) -> dict:
+        self.progress_cb = progress_cb
         return self._request({"op": "tag", "path": path, "params": params})["data"]
 
     def close(self):

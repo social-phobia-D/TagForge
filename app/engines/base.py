@@ -52,6 +52,118 @@ def custom_weights(key: str) -> str:
         return ""
 
 
+def hf_snapshot_download(repo_id: str, cache_dir: str, log_cb=None,
+                         progress_cb=None):
+    """snapshot_download + 进度回调（0-100）。
+
+    坑：huggingface_hub 只把 tqdm_class 给外层「按文件计数」的进度条用，
+    hf_hub_download 本身根本不收这个参数；而 tqdm 的 update 又会被 miniters
+    批处理合并、非 tty 下还会整个被 disable，实测一次都不回调。
+    所以这里两手抓：
+      - 外层：包 tqdm_class 并钩 __iter__，拿到「已完成文件数」；
+      - 内层：临时替换 huggingface_hub.utils.tqdm 模块里的 tqdm 符号，
+        让每个文件的字节进度条也归我们管（http_get 是显式调 update，
+        不受批处理影响），把 in-flight 文件的字节比例算进去。
+    合计百分比 = (已完成文件数 + Σ活动文件字节比例) / 总文件数。
+    任何一步出问题都只是没有进度，绝不影响下载本身。"""
+    import huggingface_hub
+    if progress_cb:
+        progress_cb(1)
+    state = {"files": 0, "done": 0, "active": {}, "last": 0}
+
+    def _emit():
+        if not progress_cb or not state["files"]:
+            return
+        try:
+            frac = sum(state["active"].values())
+            pct = int((state["done"] + min(frac, state["files"])) * 100
+                      / state["files"])
+            if pct > state["last"]:
+                state["last"] = pct
+                progress_cb(min(99, pct))
+        except Exception:
+            pass
+
+    tqdm_class = None
+    patched_mod = None
+    orig_tqdm = None
+    try:
+        import sys as _sys
+        from huggingface_hub.utils import tqdm as hf_tqdm
+        # 注意：`import huggingface_hub.utils.tqdm` 拿到的是**类**（包属性遮蔽了
+        # 子模块），必须从 sys.modules 取真正的模块才能改到 _get_progress_bar_context
+        # 用的那个全局名。
+        tqmod = _sys.modules.get("huggingface_hub.utils.tqdm")
+
+        class _OuterTqdm(hf_tqdm):
+            def __init__(self, *a, **kw):
+                super().__init__(*a, **kw)
+                # 在 __init__ 就记下文件总数：内层字节条是 worker 线程里建的，
+                # 可能比外层开始迭代还早，晚了会丢掉最早那几次上报。
+                if self.total:
+                    state["files"] = self.total
+
+            def __iter__(self):
+                if self.total:
+                    state["files"] = self.total
+                for i, obj in enumerate(super().__iter__(), 1):
+                    state["done"] = i
+                    _emit()
+                    yield obj
+
+        class _FileTqdm(hf_tqdm):
+            def __init__(self, *a, **kw):
+                super().__init__(*a, **kw)
+                self._key = None
+                self._acc = 0
+                try:
+                    if kw.get("unit") == "B" and self.total:
+                        self._key = id(self)
+                        state["active"][self._key] = 0.0
+                except Exception:
+                    pass
+
+            def update(self, n=1):
+                r = super().update(n)
+                try:
+                    # 不能读 self.n / self.initial：stderr 不是 tty 时（sidecar 把
+                    # stderr 重定向进日志文件）tqdm 会把 disable 置真并**提前
+                    # return**，连 self.n/self.initial 都不赋。所以自己累加。
+                    if self._key is not None and self.total:
+                        self._acc += max(0, n)
+                        done = min(max(getattr(self, "initial", 0), 0) + self._acc,
+                                   self.total)
+                        state["active"][self._key] = done / self.total
+                        _emit()
+                except Exception:
+                    pass
+                return r
+
+            def close(self):
+                try:
+                    if self._key is not None:
+                        state["active"].pop(self._key, None)
+                except Exception:
+                    pass
+                return super().close()
+
+        tqdm_class = _OuterTqdm
+        if tqmod is not None:
+            orig_tqdm = tqmod.tqdm
+            tqmod.tqdm = _FileTqdm  # _get_progress_bar_context 用模块全局名
+            patched_mod = tqmod
+    except Exception:
+        pass
+    try:
+        huggingface_hub.snapshot_download(
+            repo_id, cache_dir=cache_dir, tqdm_class=tqdm_class)
+    finally:
+        if patched_mod is not None:
+            patched_mod.tqdm = orig_tqdm
+        if progress_cb:
+            progress_cb(100)
+
+
 @dataclass
 class Box:
     """检测框：像素坐标（原图尺寸）。放本模块保证 sidecar 无 Qt 环境可用"""
@@ -99,6 +211,7 @@ class EngineBase:
         self._loaded = False
         self._sidecar = None
         self._last_params: dict = {}  # 供 sidecar 崩溃重启后自动重新加载
+        self._aborted = False         # 取消标志：阻止后续推理把模型又悄悄拉起来
 
     # ---------- 状态 ----------
     def deps_installed(self) -> bool:
@@ -151,19 +264,22 @@ class EngineBase:
         return self._sidecar
 
     # ---------- 操作（UI 线程调用，实际在 worker 线程执行） ----------
-    def download(self, log_cb=None):
-        """下载模型权重（依赖就绪后）"""
+    def download(self, log_cb=None, progress_cb=None):
+        """下载模型权重（依赖就绪后）。progress_cb 收 0-100 整数。"""
         cw = self.custom_weights()
         if cw:
             if log_cb:
                 log_cb(f"已设置本地权重 {cw}，跳过下载")
+            if progress_cb:
+                progress_cb(100)
             return
         if self.use_sidecar():
-            self._ensure_sidecar(log_cb).download()
+            self._ensure_sidecar(log_cb).download(progress_cb)
             return
-        self._download_impl(get_models_dir(), log_cb)
+        self._download_impl(get_models_dir(), log_cb, progress_cb)
 
-    def load(self, params: dict, log_cb=None):
+    def load(self, params: dict, log_cb=None, progress_cb=None):
+        self._aborted = False  # 新一次加载：解除上一次取消留下的拒绝状态
         params = dict(params or {})
         cw = self.custom_weights()
         if cw:
@@ -171,16 +287,22 @@ class EngineBase:
         if self.use_sidecar():
             sc = self._ensure_sidecar(log_cb)
             if not sc.is_loaded:
-                sc.load(params)
+                sc.load(params, progress_cb)
             self._loaded = True
             self._last_params = dict(params or {})
-            return
-        self._load_impl(get_models_dir(), params, log_cb)
-        self._loaded = True
+        else:
+            self._load_impl(get_models_dir(), params, log_cb, progress_cb)
+            self._loaded = True
+        if progress_cb:
+            progress_cb(100)
 
     def abort(self):
         """打断在途推理（取消打标 / 关窗用）。sidecar 引擎直接杀进程并唤醒
-        等待方；进程内引擎（WD14）无法中断当前这一张。"""
+        等待方；进程内引擎（WD14）无法中断当前这一张。
+        置 _aborted 是关键：批量线程后续还会走到 tag_image，若不拦，它会
+        发现 sidecar 已死 → 重新拉起进程并重新加载模型（数十秒），用户看到
+        的就是"点了取消却还在加载"。"""
+        self._aborted = True
         if self._sidecar:
             try:
                 self._sidecar.abort()
@@ -199,27 +321,33 @@ class EngineBase:
         self._unload_impl()
         self._loaded = False
 
-    def tag_image(self, path: str, params: dict) -> EngineResult:
+    def tag_image(self, path: str, params: dict, progress_cb=None) -> EngineResult:
+        if self._aborted:
+            raise RuntimeError("已取消")
         if self.use_sidecar():
             sc = self._ensure_sidecar()
             if not sc.is_loaded:
                 # sidecar 超时/崩溃后重建的进程是空白的，先恢复上次加载的模型
                 sc.load(self._last_params or params)
-            r = sc.tag(path, params)
+            r = sc.tag(path, params, progress_cb)
             return EngineResult(tags=r.get("tags", []), boxes=r.get("boxes", []))
-        return self._tag_impl(path, params)
+        r = self._tag_impl(path, params, progress_cb)
+        if progress_cb:
+            progress_cb(100)
+        return r
 
     # ---------- 进程内实现（sidecar worker / 源码模式调用） ----------
-    def _download_impl(self, models_dir: str, log_cb=None):
+    def _download_impl(self, models_dir: str, log_cb=None, progress_cb=None):
         raise NotImplementedError
 
-    def _load_impl(self, models_dir: str, params: dict, log_cb=None):
+    def _load_impl(self, models_dir: str, params: dict, log_cb=None,
+                   progress_cb=None):
         raise NotImplementedError
 
     def _unload_impl(self):
         pass
 
-    def _tag_impl(self, path: str, params: dict) -> EngineResult:
+    def _tag_impl(self, path: str, params: dict, progress_cb=None) -> EngineResult:
         raise NotImplementedError
 
 

@@ -31,13 +31,19 @@ class LocateAnythingEngine(EngineBase):
         return os.path.isdir(d) and any(
             x.startswith("models--nvidia--LocateAnything-3B") for x in os.listdir(d))
 
-    def _download_impl(self, models_dir: str, log_cb=None):
-        import huggingface_hub
+    def _download_impl(self, models_dir: str, log_cb=None, progress_cb=None):
         if log_cb:
             log_cb(f"LocateAnything-3B: 下载 {MODEL_ID}（{self.weights_size}，需要较长时间）...")
-        huggingface_hub.snapshot_download(MODEL_ID, cache_dir=self._cache_dir())
+        from app.engines.base import hf_snapshot_download
+        hf_snapshot_download(MODEL_ID, self._cache_dir(), log_cb, progress_cb)
 
-    def _load_impl(self, models_dir: str, params: dict, log_cb=None):
+    def _load_impl(self, models_dir: str, params: dict, log_cb=None,
+                   progress_cb=None):
+        def prog(v):
+            if progress_cb:
+                progress_cb(v)
+
+        prog(3)
         from app.engines._tcompat import patch_legacy_generation_attrs
         patch_legacy_generation_attrs()
         import importlib
@@ -45,6 +51,7 @@ class LocateAnythingEngine(EngineBase):
             log_cb("LocateAnything-3B: 导入 torch/transformers（首次约 10-20 秒）...")
         torch = importlib.import_module("torch")
         transformers = importlib.import_module("transformers")
+        prog(30)
         self.torch = torch
 
         cw = (params or {}).get("custom_weights") or self.custom_weights()
@@ -100,6 +107,7 @@ class LocateAnythingEngine(EngineBase):
                     if hasattr(m, "_attn_implementation"):
                         m._attn_implementation = "sdpa"
                 self.precision = prec
+                prog(80)
                 break
             except Exception as e:
                 last_err = e
@@ -109,6 +117,7 @@ class LocateAnythingEngine(EngineBase):
         else:
             raise RuntimeError(f"LocateAnything-3B 所有加载方式均失败: {last_err}")
 
+        prog(85)
         self.tokenizer = transformers.AutoTokenizer.from_pretrained(
             src, trust_remote_code=True, **kw)
         self.processor = transformers.AutoProcessor.from_pretrained(
@@ -173,7 +182,7 @@ class LocateAnythingEngine(EngineBase):
         return self.tokenizer.batch_decode(
             [answer], skip_special_tokens=True)[0]
 
-    def _tag_impl(self, path: str, params: dict) -> EngineResult:
+    def _tag_impl(self, path: str, params: dict, progress_cb=None) -> EngineResult:
         from PIL import Image
         img = Image.open(path).convert("RGB")
         w, h = img.size

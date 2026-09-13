@@ -49,10 +49,18 @@ class DownloadWorker(QThread):
     def __init__(self, engine, parent=None):
         super().__init__(parent)
         self.engine = engine
+        self._last_pct = -10
+
+    def _on_progress(self, value: int):
+        """每 10% 记一行，避免刷屏（进度条在打标控制区，这里是日志备份）"""
+        if value - self._last_pct >= 10:
+            self._last_pct = value
+            self.log_line.emit(tr("下载进度 {0}%").format(value))
 
     def run(self):
         try:
-            self.engine.download(log_cb=self.log_line.emit)
+            self.engine.download(log_cb=self.log_line.emit,
+                                 progress_cb=self._on_progress)
             self.download_done.emit(True, tr("模型下载完成"))
         except Exception as e:
             self.download_done.emit(False, str(e))
@@ -386,6 +394,14 @@ class EngineDialog(QDialog):
         self._log(f"[{tr(engine.title)}] {tr('加载模型 ...')}")
         w = EngineLoadWorker(engine, {})
         w.log_line.connect(self._log)
+        state = {"last": -10}
+
+        def on_prog(v, s=state, e=engine):
+            if v - s["last"] >= 10:
+                s["last"] = v
+                self._log(f"[{tr(e.title)}] {tr('加载进度 {0}%').format(v)}")
+
+        w.progress.connect(on_prog)
         w.load_done.connect(
             lambda ok, msg, e=engine: self._log(
                 f"[{tr(e.title)}] {tr('加载成功') if ok else tr('加载失败: {0}').format(msg)}"))

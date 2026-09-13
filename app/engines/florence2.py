@@ -30,13 +30,19 @@ class Florence2Engine(EngineBase):
         return os.path.isdir(d) and any(
             x.startswith("models--microsoft--Florence-2-base") for x in os.listdir(d))
 
-    def _download_impl(self, models_dir: str, log_cb=None):
-        import huggingface_hub
+    def _download_impl(self, models_dir: str, log_cb=None, progress_cb=None):
         if log_cb:
             log_cb(f"Florence-2: 下载 {MODEL_ID}（{self.weights_size}）...")
-        huggingface_hub.snapshot_download(MODEL_ID, cache_dir=self._cache_dir())
+        from app.engines.base import hf_snapshot_download
+        hf_snapshot_download(MODEL_ID, self._cache_dir(), log_cb, progress_cb)
 
-    def _load_impl(self, models_dir: str, params: dict, log_cb=None):
+    def _load_impl(self, models_dir: str, params: dict, log_cb=None,
+                   progress_cb=None):
+        def prog(v):
+            if progress_cb:
+                progress_cb(v)
+
+        prog(3)
         from app.engines._tcompat import patch_legacy_generation_attrs
         patch_legacy_generation_attrs()
         import importlib
@@ -44,6 +50,7 @@ class Florence2Engine(EngineBase):
             log_cb("Florence-2: 导入 torch/transformers（首次约 10-20 秒）...")
         torch = importlib.import_module("torch")
         transformers = importlib.import_module("transformers")
+        prog(40)
         self.torch = torch
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         dtype = torch.float16 if self.device == "cuda" else torch.float32
@@ -54,10 +61,12 @@ class Florence2Engine(EngineBase):
             log_cb(f"Florence-2: 加载到 {self.device} ...")
         self.processor = transformers.AutoProcessor.from_pretrained(
             src, trust_remote_code=True, **kw)
+        prog(55)
         self.model = transformers.AutoModelForCausalLM.from_pretrained(
             src, trust_remote_code=True, torch_dtype=dtype,
             **kw).to(self.device).eval()
         self._patch_config()
+        prog(95)
 
     def _patch_config(self):
         """transformers 5.x 严格属性访问下，Florence-2 远程 config 类缺失
@@ -115,16 +124,31 @@ class Florence2Engine(EngineBase):
         return self.processor.post_process_generation(
             decoded, task=task, image_size=pil_image.size)
 
-    def _tag_impl(self, path: str, params: dict) -> EngineResult:
+    def _tag_impl(self, path: str, params: dict, progress_cb=None) -> EngineResult:
         from PIL import Image
         result = EngineResult()
         img = Image.open(path).convert("RGB")
-        if params.get("caption", True):
+        # 一次推理要跑 caption/OD/每个短语好几轮，CPU 下每轮十几秒。
+        # 按轮次分步上报，进度条才不会整张图都停在 0%。
+        phrases_raw = str(params.get("phrases") or "").strip()
+        phrases = [p.strip() for p in re.split(r"[,，、;\n]+", phrases_raw) if p.strip()]
+        do_cap = bool(params.get("caption", True))
+        do_obj = bool(params.get("objects", True))
+        steps = (1 if do_cap else 0) + (1 if do_obj else 0) + len(phrases)
+        done = [0]
+
+        def step():
+            done[0] += 1
+            if progress_cb and steps:
+                progress_cb(min(99, int(done[0] * 100 / steps)))
+
+        if do_cap:
             r = self._generate("<MORE_DETAILED_CAPTION>", None, img)
             cap = str(r.get("<MORE_DETAILED_CAPTION>", "")).strip()
             if cap:
                 result.tags.append(cap)
-        if params.get("objects", True):
+            step()
+        if do_obj:
             r = self._generate("<OD>", None, img)
             od = r.get("<OD>", {})
             for bbox, label in zip(od.get("bboxes", []), od.get("labels", [])):
@@ -135,13 +159,14 @@ class Florence2Engine(EngineBase):
                     label=label, conf=0.0,
                     x1=float(bbox[0]), y1=float(bbox[1]),
                     x2=float(bbox[2]), y2=float(bbox[3])))
+            step()
 
         # 短语定位：每个短语单独跑一次 grounding，命中则出框。
         # Florence 对裸名词定位不稳（易出全图框），自动补上下文后缀提高命中率
-        phrases_raw = str(params.get("phrases") or "").strip()
-        if phrases_raw:
-            for ph in re.split(r"[,，、;\n]+", phrases_raw):
-                ph = ph.strip()
+        if phrases:
+            for ph in phrases:
+                if progress_cb and steps:
+                    progress_cb(min(99, int(done[0] * 100 / steps)))
                 if not ph:
                     continue
                 q = ph if " in the image" in ph.lower() else ph + " in the image"
@@ -159,4 +184,5 @@ class Florence2Engine(EngineBase):
                         label=label, conf=0.0,
                         x1=float(bbox[0]), y1=float(bbox[1]),
                         x2=float(bbox[2]), y2=float(bbox[3])))
+                step()
         return result

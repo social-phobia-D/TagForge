@@ -32,19 +32,31 @@ class Wd14Engine(EngineBase):
         return os.path.exists(os.path.join(d, "model.onnx")) and os.path.exists(
             os.path.join(d, "selected_tags.csv"))
 
-    def _download_impl(self, models_dir: str, log_cb=None):
+    def _download_impl(self, models_dir: str, log_cb=None, progress_cb=None):
         import huggingface_hub
         d = self._model_dir()
         os.makedirs(d, exist_ok=True)
-        for fn in ("model.onnx", "selected_tags.csv"):
+        files = ("model.onnx", "selected_tags.csv")
+        for i, fn in enumerate(files):
             if log_cb:
                 log_cb(f"WD14: 下载 {REPO}/{fn} ...")
+            if progress_cb:
+                progress_cb(int(i * 100 / len(files)))
+            # hf_hub_download 不接受进度回调，只能按文件给里程碑百分比；
+            # 单文件内部进度由库自己打到 stderr（sidecar 日志）。
             huggingface_hub.hf_hub_download(REPO, fn, local_dir=d)
+            if progress_cb:
+                progress_cb(int((i + 1) * 100 / len(files)))
 
-    def _load_impl(self, models_dir: str, params: dict, log_cb=None):
+    def _load_impl(self, models_dir: str, params: dict, log_cb=None,
+                   progress_cb=None):
+        if progress_cb:
+            progress_cb(5)
         if log_cb:
             log_cb("WD14: 导入 onnxruntime ...")
         import onnxruntime as ort
+        if progress_cb:
+            progress_cb(40)
         d = (params or {}).get("custom_weights") \
             or self.custom_weights() or self._model_dir()
         providers = ["CPUExecutionProvider"]
@@ -57,6 +69,8 @@ class Wd14Engine(EngineBase):
         if log_cb:
             log_cb(f"WD14: 使用 {'CUDA' if 'CUDA' in providers[0] else 'CPU'} 推理")
         self.session = ort.InferenceSession(os.path.join(d, "model.onnx"), providers=providers)
+        if progress_cb:
+            progress_cb(85)
         inp = self.session.get_inputs()[0]
         self.input_name = inp.name
         # NHWC: [batch, H, W, 3] -> target 取 H
@@ -80,7 +94,7 @@ class Wd14Engine(EngineBase):
         arr = np.asarray(pil, dtype=np.float32)
         return arr
 
-    def _tag_impl(self, path: str, params: dict) -> EngineResult:
+    def _tag_impl(self, path: str, params: dict, progress_cb=None) -> EngineResult:
         t_general = float(params.get("general_threshold", 0.35))
         t_char = float(params.get("char_threshold", 0.85))
         underscores = bool(params.get("underscores", False))

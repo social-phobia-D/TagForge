@@ -37,7 +37,7 @@ class YoloWorldEngine(EngineBase):
             return os.path.isfile(cw)
         return os.path.exists(self._weights_path())
 
-    def _download_impl(self, models_dir: str, log_cb=None):
+    def _download_impl(self, models_dir: str, log_cb=None, progress_cb=None):
         if log_cb:
             log_cb("YOLO-World: 下载 yolov8s-worldv2.pt ...")
         from app.engines.sidecar import download_file  # 带超时的分块下载
@@ -49,7 +49,8 @@ class YoloWorldEngine(EngineBase):
         last_err = None
         for url in urls:
             try:
-                download_file(url, self._weights_path(), log_cb, timeout=120)
+                download_file(url, self._weights_path(), log_cb, timeout=120,
+                              progress_cb=progress_cb)
                 break
             except Exception as e:
                 last_err = e
@@ -58,10 +59,17 @@ class YoloWorldEngine(EngineBase):
         if log_cb:
             log_cb("YOLO-World: 下载完成")
 
-    def _load_impl(self, models_dir: str, params: dict, log_cb=None):
+    def _load_impl(self, models_dir: str, params: dict, log_cb=None,
+                   progress_cb=None):
+        def prog(v):
+            if progress_cb:
+                progress_cb(v)
+
+        prog(5)
         if log_cb:
             log_cb("YOLO-World: 导入 ultralytics（首次约 5 秒）...")
         from ultralytics import YOLO
+        prog(35)
         wpt = (params or {}).get("custom_weights") \
             or self.custom_weights() or self._weights_path()
         self.model = YOLO(wpt)
@@ -71,6 +79,7 @@ class YoloWorldEngine(EngineBase):
         except Exception:
             self.device = "cpu"
         self._last_classes = None
+        prog(60)
         # 预热：第一次 set_classes 会按需拉 CLIP 文本编码器（约 338MB）。
         # 放在加载阶段并给出提示，否则用户第一次推理时界面毫无动静，
         # 看起来就是"卡死"（实际在下模型）。
@@ -82,6 +91,7 @@ class YoloWorldEngine(EngineBase):
             if log_cb:
                 log_cb(f"YOLO-World: 文本编码器预热失败，首次推理时重试: {e}")
         self._last_classes = None
+        prog(95)
         if log_cb:
             log_cb(f"YOLO-World: 就绪 ({'GPU' if self.device == 0 else 'CPU'})")
 
@@ -112,7 +122,7 @@ class YoloWorldEngine(EngineBase):
     def _unload_impl(self):
         self.model = None
 
-    def _tag_impl(self, path: str, params: dict) -> EngineResult:
+    def _tag_impl(self, path: str, params: dict, progress_cb=None) -> EngineResult:
         result = EngineResult()
         vocab = [c.strip() for c in str(params.get("classes", "")).split(",") if c.strip()]
         if not vocab:

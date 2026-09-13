@@ -200,7 +200,7 @@ class _FakeEngine:
     def abort(self):
         self.aborted = True
 
-    def tag_image(self, path, params):
+    def tag_image(self, path, params, progress_cb=None):
         raise RuntimeError("已取消")
 
 
@@ -214,12 +214,232 @@ ye._loaded = True
 ye.abort()
 assert ye._loaded is False, "abort 后应视为未加载"
 
+# ---- 6. 取消后不再偷偷重启 sidecar / 重新加载模型（_aborted 闸门）----
+from app.engines.base import EngineBase, EngineResult
+
+
+class _ProbeEngine(EngineBase):
+    key = "probe"
+    title = "探针引擎"
+
+    def __init__(self):
+        super().__init__()
+        self.tagged = 0
+
+    def weights_ready(self):
+        return True
+
+    def _download_impl(self, models_dir, log_cb=None, progress_cb=None):
+        pass
+
+    def _load_impl(self, models_dir, params, log_cb=None, progress_cb=None):
+        if progress_cb:
+            progress_cb(100)
+
+    def _tag_impl(self, path, params, progress_cb=None):
+        self.tagged += 1
+        return EngineResult(tags=["x"])
+
+
+pe = _ProbeEngine()
+pe.load({})
+assert pe.tagged == 0
+pe.tag_image("a.jpg", {})
+assert pe.tagged == 1, "正常状态下应能推理"
+# 取消中：tag_image 必须立刻抛错，绝不能再走 _ensure_sidecar()→重新加载模型
+pe.abort()
+try:
+    pe.tag_image("b.jpg", {})
+    raise AssertionError("abort 后 tag_image 应立刻失败")
+except RuntimeError as e:
+    assert "取消" in str(e), e
+assert pe.tagged == 1, "取消后不应再执行推理"
+# 重新加载（=下一次打标）后必须解除闸门
+pe.load({})
+pe.tag_image("c.jpg", {})
+assert pe.tagged == 2, "load() 应清除 _aborted"
+
+# 批量：取消后不得进入下一个引擎（否则它会重新拉起 sidecar 并重新加载）
+from threading import Event
+
+
+class _SlowEngine:
+    """第一张图卡住直到被 abort；第二个引擎必须完全不被调用"""
+
+    key = "slow"
+    title = "慢引擎"
+
+    def __init__(self):
+        self.entered = Event()   # 已进入推理（测试线程据此触发取消）
+        self.release = Event()   # abort() 后放行在途推理
+        self.aborted = False
+        self.calls = 0
+
+    def abort(self):
+        self.aborted = True
+        self.release.set()
+
+    def tag_image(self, path, params, progress_cb=None):
+        self.calls += 1
+        self.entered.set()
+        self.release.wait(10)     # 模拟卡在途中的长推理
+        raise RuntimeError("已取消")
+
+
+class _NeverEngine:
+    key = "never"
+    title = "不该被调用的引擎"
+    calls = 0
+
+    def abort(self):
+        pass
+
+    def tag_image(self, path, params, progress_cb=None):
+        type(self).calls += 1
+        raise AssertionError("取消后不应再调用下一个引擎")
+
+
+slow, never = _SlowEngine(), _NeverEngine()
+
+
+class _Item:
+    def __init__(self):
+        self.path = "x.jpg"
+        self.tags = []
+        self.boxes = []
+        self.tags_by_src = {}
+
+    def rebuild_merged(self):
+        pass
+
+
+class _Store:
+    def find(self, path):
+        return _Item()       # 两个引擎都会抛错，_merge 不会被执行
+
+
+bw2 = BatchWorker(None, [slow, never], ["x.jpg"], {}, "replace", "", "")
+bw2.store = _Store()
+
+
+def _cancel_when_inside():
+    assert slow.entered.wait(5), "第一个引擎没有被调用"
+    bw2.stop()
+
+
+from threading import Thread
+tc = Thread(target=_cancel_when_inside)
+tc.start()
+bw2.run()          # 直接同步跑（不起线程，便于断言）
+tc.join()
+assert slow.calls == 1, slow.calls
+assert slow.aborted is True
+assert _NeverEngine.calls == 0, "取消后必须停止，不能再进入下一个引擎"
+
+# ---- 7. 下载进度回调（字节级，断网也能验）----
+from app.engines.sidecar import _download
+
+os.makedirs("test_images", exist_ok=True)
+SRC = os.path.abspath("test_images/_prog_src.bin")
+DST = os.path.abspath("test_images/_prog_dst.bin")
+with open(SRC, "wb") as f:
+    f.write(b"\0" * (3 << 20))
+
+
+class _Srv:
+    """本地 HTTP 服务：模拟一个带 Content-Length 的权重下载"""
+    def __init__(self, data):
+        self.data = data
+        import http.server
+        outer = self
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                rng = self.headers.get("Range")
+                start = 0
+                if rng and rng.startswith("bytes="):
+                    start = int(rng.split("=")[1].split("-")[0])
+                body = outer.data[start:]
+                self.send_response(206 if start else 200)
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Content-Range",
+                                 f"bytes {start}-{len(outer.data)-1}/{len(outer.data)}")
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *a):
+                pass
+
+        self.httpd = http.server.HTTPServer(("127.0.0.1", 0), H)
+        self.thread = Thread(target=self.httpd.serve_forever, daemon=True)
+
+    def __enter__(self):
+        self.thread.start()
+        return f"http://127.0.0.1:{self.httpd.server_address[1]}/w.bin"
+
+    def __exit__(self, *a):
+        self.httpd.shutdown()
+
+
+with open(SRC, "rb") as f:
+    payload = f.read()
+with _Srv(payload) as url:
+    pcts = []
+    _download(url, DST, None, timeout=10, progress_cb=pcts.append)
+assert os.path.getsize(DST) == len(payload), "下载内容应完整"
+assert pcts[-1] == 100, pcts[-3:]
+assert pcts == sorted(pcts), "进度不可回退"
+assert len(pcts) > 1, "应上报多次进度"
+
+# hf_snapshot_download：外层按文件 + 内层按字节的合成进度（离线模拟）
+import huggingface_hub
+from huggingface_hub.utils.tqdm import _get_progress_bar_context
+from tqdm.contrib.concurrent import thread_map
+
+_FAKE = [("big.safetensors", 600), ("big2.safetensors", 300),
+         ("config.json", 1), ("tokenizer.json", 99)]
+_SIZE = dict(_FAKE)
+_real_snapshot = huggingface_hub.snapshot_download
+
+
+def _fake_snapshot(repo_id, *, cache_dir=None, tqdm_class=None, **kw):
+    import time
+
+    def one(name):
+        with _get_progress_bar_context(desc=name, log_level=40,
+                                       total=_SIZE[name], initial=0,
+                                       unit="B") as pbar:
+            for _ in range(_SIZE[name]):
+                time.sleep(0.0002)   # 真实下载不是瞬间完成的
+                pbar.update(1)
+        return name
+    list(thread_map(one, [f for f, _ in _FAKE], desc="F", max_workers=4,
+                    tqdm_class=tqdm_class))
+
+
+huggingface_hub.snapshot_download = _fake_snapshot
+try:
+    from app.engines.base import hf_snapshot_download
+    hp = []
+    hf_snapshot_download("fake/repo", "test_images/_hf", None, hp.append)
+finally:
+    huggingface_hub.snapshot_download = _real_snapshot
+assert hp[-1] == 100, hp[-3:]
+assert hp == sorted(hp), f"HF 进度不可回退: {hp}"
+assert len(hp) > 8, f"HF 进度粒度太粗（内层字节进度没生效）: {hp}"
+
 # ---- 清理 ----
 st.set_last_dir(old_dir)
 os.remove(IMG)
 import shutil
 shutil.rmtree("test_images/labels", ignore_errors=True)
 shutil.rmtree("test_images/wd14fake", ignore_errors=True)
+shutil.rmtree("test_images/_hf", ignore_errors=True)
+for _f in (SRC, DST):
+    try:
+        os.remove(_f)
+    except OSError:
+        pass
 q.setValue("weights/wd14", old_wd14_w)
 q.setValue("weights/yoloworld", old_yolo_w)
 print("ALL OK")

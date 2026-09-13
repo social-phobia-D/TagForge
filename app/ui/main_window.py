@@ -358,8 +358,9 @@ class MainWindow(QMainWindow):
         rv.addLayout(btn_row)
 
         self.progress = QProgressBar()
-        self.progress.setRange(0, 1)
+        self.progress.setRange(0, 100)
         self.progress.setValue(0)
+        self.progress.setFormat("%p%")  # 数字百分比，下载/加载/推理共用
         rv.addWidget(self.progress)
 
         self.tag_log = QPlainTextEdit()
@@ -917,11 +918,19 @@ class MainWindow(QMainWindow):
             return
         eng = self._pending_loads[0]
         self._log(tr("[{0}] 加载模型…").format(tr(eng.title)))
+        self.progress.setRange(0, 100)
+        self.progress.setValue(0)
         self._load_worker = EngineLoadWorker(
             eng, self._params_by_key().get(eng.key, {}))
         self._load_worker.log_line.connect(self._log)
+        self._load_worker.progress.connect(self._on_load_progress)
         self._load_worker.load_done.connect(self._on_load_done)
         self._load_worker.start()
+
+    def _on_load_progress(self, value):
+        self.progress.setValue(value)
+        title = tr(self._pending_loads[0].title) if self._pending_loads else ""
+        self.status_msg.setText(tr("准备模型 {0}%：{1}").format(value, title))
 
     def _on_load_done(self, ok, msg):
         if self._pending_loads:
@@ -950,13 +959,16 @@ class MainWindow(QMainWindow):
         self.batch.failed_one.connect(
             lambda p, e: self._log(tr("失败 {0}: {1}").format(os.path.basename(p), e)))
         self.batch.finished_all.connect(self._on_batch_done)
-        self.progress.setRange(0, len(self._paths_to_tag))
+        # 单位 = 图片数 × 引擎数 × 100（引擎内部再按自己的 0-100 细分）
+        n_eng = max(1, len(self._tagging_engines))
+        self.progress.setRange(0, len(self._paths_to_tag) * n_eng * 100)
         self.progress.setValue(0)
         self.batch.start()
 
     def _on_batch_progress(self, done, total, name):
         self.progress.setValue(done)
-        self.status_msg.setText(tr("打标中 {0}/{1}: {2}").format(done, total, name))
+        pct = int(done * 100 / total) if total else 0
+        self.status_msg.setText(tr("打标中 {0}%：{1}").format(pct, name))
 
     def _on_image_done(self, path, tags, boxes):
         li = self._thumb_items.get(path)
@@ -1009,6 +1021,8 @@ class MainWindow(QMainWindow):
         self.preview.locked = busy
         if busy and label:
             self.status_msg.setText(label)
+        if not busy:
+            self.progress.setValue(0)
 
     def _unload_models(self):
         for eng in self.engines:

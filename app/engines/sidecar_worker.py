@@ -5,6 +5,7 @@
 import json
 import os
 import sys
+import threading
 
 
 def main():
@@ -28,12 +29,26 @@ def main():
     proto = sys.stdout
     sys.stdout = sys.stderr
 
+    # 进度回调是从下载线程（huggingface_hub 的线程池 / 我们的字节条）里打的，
+    # 多个线程同时 write 会把两行 JSON 交错拼在一起 → 父进程解析不到 reply，
+    # 只能干等满超时（又是"卡死"）。写协议必须串行。
+    _send_lock = threading.Lock()
+
     def send(obj):
-        proto.write(json.dumps(obj, ensure_ascii=False) + "\n")
-        proto.flush()
+        line = json.dumps(obj, ensure_ascii=False) + "\n"
+        with _send_lock:
+            proto.write(line)
+            proto.flush()
 
     def log(msg):
         send({"type": "log", "msg": msg})
+
+    def prog(value):
+        """进度上报（0-100）。父进程按 type=progress 分发给 UI 进度条"""
+        try:
+            send({"type": "progress", "value": int(value)})
+        except Exception:
+            pass
 
     try:
         from app.engines.base import get_engine
@@ -53,13 +68,14 @@ def main():
         op = req.get("op")
         try:
             if op == "download":
-                engine._download_impl(req.get("models_dir"), log)
+                engine._download_impl(req.get("models_dir"), log, prog)
                 send({"type": "done"})
             elif op == "load":
-                engine._load_impl(req.get("models_dir"), req.get("params") or {}, log)
+                engine._load_impl(req.get("models_dir"), req.get("params") or {},
+                                  log, prog)
                 send({"type": "loaded", "ok": True, "msg": "ok"})
             elif op == "tag":
-                r = engine._tag_impl(req["path"], req.get("params") or {})
+                r = engine._tag_impl(req["path"], req.get("params") or {}, prog)
                 boxes = [b.__dict__ for b in r.boxes]
                 send({"type": "result", "data": {"tags": r.tags, "boxes": boxes}})
             elif op == "exit":
