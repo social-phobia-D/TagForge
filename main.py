@@ -8,6 +8,36 @@ def _res_path():
     return os.path.dirname(os.path.abspath(__file__))
 
 
+def _setup_frozen_qt_dlls():
+    """冻结版启动前显式注册 PySide6 的 DLL 目录并预加载 Qt。"""
+    if os.name != "nt" or not getattr(sys, "frozen", False):
+        return
+    base = getattr(sys, "_MEIPASS", os.path.dirname(sys.executable))
+    pyside = os.path.join(base, "PySide6")
+    shiboken = os.path.join(base, "shiboken6")
+    for folder in (shiboken, pyside, base):
+        if not os.path.isdir(folder):
+            continue
+        try:
+            os.add_dll_directory(folder)
+        except OSError:
+            pass
+        os.environ["PATH"] = folder + os.pathsep + os.environ.get("PATH", "")
+    try:
+        import ctypes
+        for folder, name in (
+                (shiboken, "shiboken6.abi3.dll"),
+                (pyside, "Qt6Core.dll"),
+                (pyside, "pyside6.abi3.dll"),
+                (pyside, "Qt6Gui.dll"),
+                (pyside, "Qt6Widgets.dll")):
+            path = os.path.join(folder, name)
+            if os.path.isfile(path):
+                ctypes.WinDLL(path)
+    except OSError:
+        pass
+
+
 def _setup_crash_log():
     """console=False 打包后 stderr 不可见，未捕获异常会无声消失。
     把 faulthandler 与 excepthook 输出落到数据目录 logs/，用户报障有据可查。"""
@@ -44,6 +74,7 @@ def _setup_crash_log():
 
 
 def main():
+    _setup_frozen_qt_dlls()
     # 数据目录（模型/运行时）可选自定义，默认在程序所在盘
     try:
         from PySide6.QtCore import QSettings

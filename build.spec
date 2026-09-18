@@ -36,7 +36,8 @@ a = Analysis(
         'PySide6.QtLocation', 'PySide6.QtSensors', 'PySide6.QtSerialPort',
         'PySide6.QtTest', 'PySide6.QtDesigner', 'PySide6.Qt3DCore',
     ],
-    noarchive=False,
+    # PySide6 在冻结包中需要真实的包路径来注册 Qt DLL 搜索目录。
+    noarchive=True,
 )
 
 # excludes 只能拦 Python 模块，PySide6 hook 捆绑的 Qt DLL 需在这里过滤。
