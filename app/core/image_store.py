@@ -14,6 +14,7 @@ class ImageItem:
     tags: list = field(default_factory=list)  # 全部来源合并视图（只读用途：筛选/补全/导出）
     tags_by_src: dict = field(default_factory=dict)  # 引擎key -> 标签列表（独立文件）
     boxes: list = field(default_factory=list)  # list[Box]
+    boxes_by_src: dict = field(default_factory=dict)  # source -> list[Box]
 
     @property
     def name(self) -> str:
@@ -21,7 +22,7 @@ class ImageItem:
 
     @property
     def has_tags(self) -> bool:
-        return bool(self.tags)
+        return bool(self.tags or self.boxes)
 
     def rebuild_merged(self):
         """由各来源列表重建合并视图（保持来源顺序，去重）"""
@@ -31,6 +32,46 @@ class ImageItem:
                 if t not in out:
                     out.append(t)
         self.tags = out
+
+    def ensure_box_sources(self):
+        """兼容旧对象：没有来源信息的框全部视为手工/旧版框。"""
+        if not self.boxes_by_src and self.boxes:
+            self.boxes_by_src = {"manual": list(self.boxes)}
+        self.rebuild_boxes()
+
+    def rebuild_boxes(self):
+        """由各来源框重建画布显示用的合并视图，不覆盖任何来源。"""
+        if not self.boxes_by_src:
+            return
+        self.boxes = [b for boxes in self.boxes_by_src.values() for b in boxes]
+
+    def set_boxes_for_src(self, source: str, boxes: list):
+        self.ensure_box_sources()
+        self.boxes_by_src[source] = list(boxes or [])
+        self.rebuild_boxes()
+
+    def add_box(self, box: Box, source: str = "manual"):
+        self.ensure_box_sources()
+        self.boxes_by_src.setdefault(source, []).append(box)
+        self.rebuild_boxes()
+
+    def source_for_box(self, box: Box) -> str:
+        self.ensure_box_sources()
+        for source, boxes in self.boxes_by_src.items():
+            if any(candidate is box for candidate in boxes):
+                return source
+        return "manual"
+
+    def remove_box(self, box: Box) -> bool:
+        """按对象身份从其来源移除一个框；返回是否找到。"""
+        self.ensure_box_sources()
+        for boxes in self.boxes_by_src.values():
+            for i, candidate in enumerate(boxes):
+                if candidate is box:
+                    del boxes[i]
+                    self.rebuild_boxes()
+                    return True
+        return False
 
 
 class ImageStore(QObject):
@@ -68,8 +109,10 @@ class ImageStore(QObject):
             if tags:
                 item.tags_by_src[key] = tags
         item.rebuild_merged()
-        from app.core.tag_writer import read_yolo_boxes  # 延迟导入避免环
-        item.boxes = read_yolo_boxes(path)
+        from app.core.tag_writer import read_yolo_boxes_by_src  # 延迟导入避免环
+        item.boxes_by_src = read_yolo_boxes_by_src(path)
+        item.boxes = []
+        item.rebuild_boxes()
         self.items.append(item)
         self._index[path] = item
 
@@ -82,6 +125,7 @@ class ImageStore(QObject):
         c = Counter()
         for it in self.items:
             c.update(it.tags)
+            c.update(b.label for b in it.boxes if getattr(b, "label", "").strip())
         return [t for t, _ in c.most_common()]
 
     def tag_frequency(self) -> list:
@@ -102,7 +146,6 @@ class ImageStore(QObject):
                     write_src_tags(it.path, key, new)
             it.rebuild_merged()
 
-
 def _txt_path(img_path: str) -> str:
     return os.path.splitext(img_path)[0] + ".txt"
 
@@ -115,14 +158,41 @@ def src_keys() -> list:
 
 def src_txt_path(img_path: str, key: str) -> str:
     """来源标签文件：<图名>.<来源>.txt；main = 传统 <图名>.txt"""
-    stem = os.path.splitext(img_path)[0]
-    return f"{stem}.txt" if key == "main" else f"{stem}.{key}.txt"
+    directory = os.path.dirname(img_path)
+    stem = _artifact_stem(img_path)
+    base = os.path.join(directory, stem)
+    return f"{base}.txt" if key == "main" else f"{base}.{key}.txt"
+
+
+def _artifact_stem(img_path: str) -> str:
+    """副文件 stem；同目录同名不同扩展名时避免静默覆盖。"""
+    directory = os.path.dirname(img_path) or "."
+    stem, ext = os.path.splitext(os.path.basename(img_path))
+    try:
+        siblings = [name for name in os.listdir(directory)
+                    if os.path.splitext(name)[1].lower() in IMAGE_EXTS
+                    and os.path.splitext(name)[0].casefold() == stem.casefold()]
+    except OSError:
+        siblings = [os.path.basename(img_path)]
+    if len(siblings) > 1:
+        return f"{stem}.{ext.lstrip('.').lower()}"
+    return stem
 
 
 def read_src_tags(img_path: str, key: str) -> list:
     p = src_txt_path(img_path, key)
     if not os.path.exists(p):
-        return []
+        # 同名不同扩展名以前共用一个副文件。新版本写入时会隔离，
+        # 但读取仍回退到旧路径，避免升级后历史标签静默消失。
+        stem = os.path.splitext(os.path.basename(img_path))[0]
+        if _artifact_stem(img_path) != stem:
+            directory = os.path.dirname(img_path)
+            base = os.path.join(directory, stem)
+            legacy = f"{base}.txt" if key == "main" else f"{base}.{key}.txt"
+            if os.path.exists(legacy):
+                p = legacy
+        if not os.path.exists(p):
+            return []
     try:
         with open(p, "r", encoding="utf-8-sig") as f:
             raw = f.read()

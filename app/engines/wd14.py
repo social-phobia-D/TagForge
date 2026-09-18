@@ -27,7 +27,9 @@ class Wd14Engine(EngineBase):
     def weights_ready(self) -> bool:
         cw = self.custom_weights()
         if cw:
-            return os.path.isfile(os.path.join(cw, "model.onnx"))
+            return (os.path.isfile(os.path.join(cw, "model.onnx")) and
+                    os.path.getsize(os.path.join(cw, "model.onnx")) > 0 and
+                    os.path.isfile(os.path.join(cw, "selected_tags.csv")))
         d = self._model_dir()
         return os.path.exists(os.path.join(d, "model.onnx")) and os.path.exists(
             os.path.join(d, "selected_tags.csv"))

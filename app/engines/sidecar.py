@@ -57,11 +57,26 @@ _CHECK_CACHE: dict = {}  # (python_exe, engine.key) -> 缺失模块列表
 
 # 只做模块定位（find_spec 不执行模块），毫秒级
 _CHECK_SCRIPT = """
+import importlib.metadata as _md
 import importlib.util as _u, json, sys
 if sys.version_info < (3, 10):
     print(json.dumps({"ok": False, "reason": "python<3.10"}))
 else:
-    missing = [m for m in sys.argv[1:] if _u.find_spec(m) is None]
+    args = sys.argv[1:]
+    split = args.index("--") if "--" in args else len(args)
+    modules = args[:split]
+    specs = args[split + 1:]
+    missing = [m for m in modules if _u.find_spec(m) is None]
+    for spec in specs:
+        if "==" not in spec:
+            continue
+        name, expected = spec.split("==", 1)
+        try:
+            actual = _md.version(name)
+        except _md.PackageNotFoundError:
+            actual = None
+        if actual != expected and name not in missing:
+            missing.append(name)
     print(json.dumps({"ok": not missing, "missing": missing}))
 """
 
@@ -80,9 +95,10 @@ def check_python_deps(python_exe: str, engine) -> list:
     mods = list(engine.import_deps or
                 [p.replace("-", "_") for p in engine.pip_deps])
     missing = list(mods)
+    specs = [p for p in engine.pip_deps if "==" in p]
     try:
         r = subprocess.run(
-            [python_exe, "-c", _CHECK_SCRIPT] + mods,
+            [python_exe, "-c", _CHECK_SCRIPT] + mods + ["--"] + specs,
             capture_output=True, text=True, encoding="utf-8",
             errors="replace", timeout=30, creationflags=CREATE_NO_WINDOW)
         lines = [l for l in (r.stdout or "").strip().splitlines() if l.strip()]
@@ -120,8 +136,7 @@ def install_target() -> str:
 def _runtime_marker_ok(engine) -> bool:
     if not runtime_ready():
         return False
-    marker = next((p for p in engine.pip_deps if p != "torch"), None)
-    return marker is None or os.path.exists(os.path.join(site_packages(), marker))
+    return not check_python_deps(runtime_python(), engine)
 
 
 def sidecar_deps_ready(engine) -> bool:

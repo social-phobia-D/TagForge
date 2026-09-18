@@ -85,10 +85,15 @@ from app.ui.main_window import MainWindow
 
 st = AppSettings()
 old_dir = st.get_last_dir()
+test_settings = QSettings("Dabiao", "dabiao")
+old_language = test_settings.value("general/language", "zh")
+old_merge = st.get_merge_mode()
 st.set_last_dir("")  # 避免构造时加载真实目录/启动缩略图线程
-QSettings("Dabiao", "dabiao").setValue("general/language", "zh")
+test_settings.setValue("general/language", "zh")
+st.set_merge_mode("append")
 
 mw = MainWindow()
+assert mw.merge_combo.currentIndex() == 1, "追加模式应从设置恢复"
 NAME = "a_very_long_file_name_that_needs_elide_1234567890.png"
 li = QListWidgetItem(NAME)
 li.setData(Qt.UserRole, "x")
@@ -119,10 +124,13 @@ item2 = ImageItem(path=IMG)
 item2.boxes = [Box(label="dog", x1=1, y1=1, x2=10, y2=10),
                Box(label="dog", x1=5, y1=5, x2=20, y2=20),
                Box(label="person", x1=2, y1=2, x2=30, y2=30)]
+item2.set_boxes_for_src("yoloworld", [
+    Box(label="car", x1=40, y1=40, x2=80, y2=80)])
 mw.editor.set_item(item2)
 labels = [mw.editor.list.item(i).text()
           for i in range(mw.editor.list.count())]
 assert labels == ["dog", "dog", "person"], labels  # 每行=一个框
+assert len(item2.boxes) == 4, item2.boxes  # 自动框不能混入 manual 编辑列表
 assert mw.editor.btn_del.isEnabled(), "手动来源删除应可用"
 assert not mw.editor.btn_add.isEnabled(), "手动来源添加应禁用"
 
@@ -132,7 +140,8 @@ assert item2.boxes[0].label == "cat", "改名应同步到框"
 # 删除选中行 → 删除对应框
 mw.editor.list.setCurrentRow(1)
 mw.editor._remove_selected()
-assert len(item2.boxes) == 2 and item2.boxes[0].label == "cat"
+assert len(item2.boxes) == 3 and item2.boxes[0].label == "cat"
+assert any(b.label == "car" for b in item2.boxes), "删除 manual 框不能误删自动框"
 assert mw.editor.list.count() == 2
 
 mw.editor.src_filter.setCurrentIndex(1)  # wd14：无框来源
@@ -162,6 +171,49 @@ mw.preview.wheelEvent(QWheelEvent(QPointF(100, 100), QPointF(100, 100),
                                   Qt.NoModifier, Qt.ScrollUpdate, False))
 assert mw.preview._zoom > z0, "框隐藏时滚轮缩放应仍可用"
 
+# 非正方形图片居中时，角柄命中必须包含图片偏移
+c2 = BoxCanvas()
+c2.resize(400, 300)
+it_offset = ImageItem(path=os.path.abspath("test_images/bus.jpg"))
+it_offset.boxes = [Box(label="bus", x1=10, y1=10, x2=50, y2=50)]
+c2.set_item(it_offset)
+c2._sel = 0
+ox, oy, ss = c2._map_geo()
+assert c2._corner_at(ox + 10 * ss, oy + 10 * ss, ss) == 0
+
+# 来源化框持久化：重跑一个检测引擎只替换自己的框，空结果也会清旧框
+from app.core.tag_writer import read_yolo_boxes_by_src, write_yolo_labels
+source_item = ImageItem(path=IMG)
+source_item.add_box(Box(label="manual", x1=1, y1=1, x2=10, y2=10), "manual")
+source_item.set_boxes_for_src("yoloworld", [
+    Box(label="car", x1=20, y1=20, x2=40, y2=40)])
+assert len(source_item.boxes) == 2
+write_yolo_labels(IMG, source_item.boxes, source_item.boxes_by_src)
+loaded_sources = read_yolo_boxes_by_src(IMG)
+assert set(loaded_sources) == {"manual", "yoloworld"}
+assert len(loaded_sources["manual"]) == 1 and len(loaded_sources["yoloworld"]) == 1
+source_item.set_boxes_for_src("yoloworld", [])
+assert len(source_item.boxes) == 1 and source_item.boxes[0].label == "manual"
+
+# 同目录同 stem 的不同扩展名必须使用不同副文件
+same_jpg = os.path.abspath("test_images/_same_stem.jpg")
+same_png = os.path.abspath("test_images/_same_stem.png")
+assert img.save(same_jpg) and img.save(same_png)
+from app.core.image_store import read_src_tags, src_txt_path
+assert src_txt_path(same_jpg, "main") != src_txt_path(same_png, "main")
+# 旧版共享副文件仍可回退读取；后续保存会写入扩展名隔离的新路径。
+legacy_tags = os.path.abspath("test_images/_same_stem.txt")
+with open(legacy_tags, "w", encoding="utf-8") as _f:
+    _f.write("legacy_tag")
+assert read_src_tags(same_jpg, "main") == ["legacy_tag"]
+os.makedirs("test_images/labels", exist_ok=True)
+with open("test_images/labels/_same_stem.txt", "w", encoding="utf-8") as _f:
+    _f.write("0 0.5 0.5 0.5 0.5\n")
+with open("test_images/labels/classes.txt", "w", encoding="utf-8") as _f:
+    _f.write("legacy_box\n")
+from app.core.tag_writer import read_yolo_boxes
+assert read_yolo_boxes(same_jpg)[0].label == "legacy_box"
+
 # ================= 4. 自定义权重路径 =================
 from app.engines.base import get_engine
 
@@ -170,8 +222,10 @@ old_wd14_w = q.value("weights/wd14", "")
 old_yolo_w = q.value("weights/yoloworld", "")
 
 os.makedirs("test_images/wd14fake", exist_ok=True)
-open("test_images/wd14fake/model.onnx", "wb").close()
-open("test_images/wd14fake/selected_tags.csv", "wb").close()
+with open("test_images/wd14fake/model.onnx", "wb") as _f:
+    _f.write(b"fake onnx weights")
+with open("test_images/wd14fake/selected_tags.csv", "wb") as _f:
+    _f.write(b"name,category\nfake,0\n")
 
 q.setValue("weights/wd14", os.path.abspath("test_images/wd14fake"))
 q.setValue("weights/yoloworld", IMG)  # 任意存在的文件
@@ -336,6 +390,42 @@ assert slow.calls == 1, slow.calls
 assert slow.aborted is True
 assert _NeverEngine.calls == 0, "取消后必须停止，不能再进入下一个引擎"
 
+# ---- 6b. sidecar 回的框是 dict，必须还原成 Box（否则编辑器 b.label 崩）----
+from app.engines.base import Box
+
+
+class _FakeSidecar:
+    is_loaded = True
+    alive = True
+
+    def tag(self, path, params, progress_cb=None):
+        return {"tags": ["dog"],
+                "boxes": [{"label": "dog", "conf": 0.9, "x1": 1.0,
+                           "y1": 2.0, "x2": 3.0, "y2": 4.0}]}
+
+
+class _SidecarEngine(EngineBase):
+    key = "scprobe"
+    title = "侧车探针"
+
+    def use_sidecar(self):
+        return True
+
+    def weights_ready(self):
+        return True
+
+    def _ensure_sidecar(self, log_cb=None):
+        return _FakeSidecar()
+
+    def _tag_impl(self, path, params, progress_cb=None):
+        raise AssertionError("sidecar 模式不应走进程内实现")
+
+
+se = _SidecarEngine()
+res = se.tag_image("d.jpg", {})
+assert len(res.boxes) == 1 and isinstance(res.boxes[0], Box), res.boxes
+assert res.boxes[0].label == "dog", res.boxes[0]
+
 # ---- 7. 下载进度回调（字节级，断网也能验）----
 from app.engines.sidecar import _download
 
@@ -393,6 +483,12 @@ assert len(pcts) > 1, "应上报多次进度"
 
 # hf_snapshot_download：外层按文件 + 内层按字节的合成进度（离线模拟）
 import huggingface_hub
+import tqdm as _tqdm
+from huggingface_hub.utils import tqdm as _hf_tqdm
+# 测试只验证进度值，不需要 tqdm 的后台自适应监控线程；关闭它可避免
+# Windows 进程退出时 Python/Qt 与 daemon 线程竞争导致 access violation。
+_tqdm.tqdm.monitor_interval = 0
+_hf_tqdm.monitor_interval = 0
 from huggingface_hub.utils.tqdm import _get_progress_bar_context
 from tqdm.contrib.concurrent import thread_map
 
@@ -430,8 +526,19 @@ assert len(hp) > 8, f"HF 进度粒度太粗（内层字节进度没生效）: {h
 
 # ---- 清理 ----
 st.set_last_dir(old_dir)
+st.set_merge_mode(old_merge)
+test_settings.setValue("general/language", old_language)
 os.remove(IMG)
 import shutil
+for _img in (same_jpg, same_png):
+    try:
+        os.remove(_img)
+    except OSError:
+        pass
+try:
+    os.remove(legacy_tags)
+except OSError:
+    pass
 shutil.rmtree("test_images/labels", ignore_errors=True)
 shutil.rmtree("test_images/wd14fake", ignore_errors=True)
 shutil.rmtree("test_images/_hf", ignore_errors=True)
@@ -443,4 +550,3 @@ for _f in (SRC, DST):
 q.setValue("weights/wd14", old_wd14_w)
 q.setValue("weights/yoloworld", old_yolo_w)
 print("ALL OK")
-os._exit(0)

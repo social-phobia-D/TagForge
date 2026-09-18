@@ -147,8 +147,9 @@ class TagEditor(QWidget):
         self.item = item
         self.list.clear()
         if item:
+            item.ensure_box_sources()
             if self._cur_src() == "manual":  # 每行 = 一个检测框，一一对应
-                for b in item.boxes:
+                for b in item.boxes_by_src.get("manual", []):
                     it = QListWidgetItem(b.label)
                     it.setFlags(it.flags() | Qt.ItemIsEditable)
                     self.list.addItem(it)
@@ -225,10 +226,12 @@ class TagEditor(QWidget):
         if self._cur_src() == "manual" and self.item:
             rows = sorted({self.list.row(i) for i in self.list.selectedItems()},
                           reverse=True)
-            for r in rows:
-                if 0 <= r < len(self.item.boxes):
-                    del self.item.boxes[r]
-            if rows:
+            manual_boxes = self.item.boxes_by_src.get("manual", [])
+            boxes = [manual_boxes[r] for r in rows
+                     if 0 <= r < len(manual_boxes)]
+            for box in boxes:
+                self.item.remove_box(box)
+            if boxes:
                 self._save_boxes()
             return
         for it in self.list.selectedItems():
@@ -241,7 +244,9 @@ class TagEditor(QWidget):
         if QMessageBox.question(self, tr("清空"), tr("清空 {0} 的全部标签？").format(
                 self.item.name)) == QMessageBox.Yes:
             if self._cur_src() == "manual":
-                self.item.boxes.clear()
+                self.item.ensure_box_sources()
+                self.item.boxes_by_src.pop("manual", None)
+                self.item.rebuild_boxes()
                 self._save_boxes()
                 return
             self.list.clear()
@@ -251,12 +256,14 @@ class TagEditor(QWidget):
         """手动来源改动落盘：写 YOLO labels + 重建列表 + 通知画布重绘"""
         from app.core.tag_writer import write_yolo_labels
         try:
-            write_yolo_labels(self.item.path, self.item.boxes)
+            self.item.ensure_box_sources()
+            write_yolo_labels(self.item.path, self.item.boxes,
+                              self.item.boxes_by_src)
         except Exception:
             pass
         self._loading = True
         self.list.clear()
-        for b in self.item.boxes:
+        for b in self.item.boxes_by_src.get("manual", []):
             it = QListWidgetItem(b.label)
             it.setFlags(it.flags() | Qt.ItemIsEditable)
             self.list.addItem(it)
@@ -283,16 +290,18 @@ class TagEditor(QWidget):
         if self._cur_src() == "manual" and self.item:
             r = self.list.row(it)
             text = it.text().strip()
+            manual_boxes = self.item.boxes_by_src.get("manual", [])
+            box = manual_boxes[r] if 0 <= r < len(manual_boxes) else None
             if not text:  # 清空文字 = 删除该框
                 self._loading = True
                 self.list.takeItem(r)
                 self._loading = False
-                if 0 <= r < len(self.item.boxes):
-                    del self.item.boxes[r]
+                if box is not None:
+                    self.item.remove_box(box)
                     self._save_boxes()
                 return
-            if 0 <= r < len(self.item.boxes):
-                self.item.boxes[r].label = text
+            if box is not None:
+                box.label = text
                 self._save_boxes()
             return
         if not it.text().strip():

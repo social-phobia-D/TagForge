@@ -34,8 +34,9 @@ class YoloWorldEngine(EngineBase):
     def weights_ready(self) -> bool:
         cw = self.custom_weights()
         if cw:
-            return os.path.isfile(cw)
-        return os.path.exists(self._weights_path())
+            return os.path.isfile(cw) and os.path.getsize(cw) > 0
+        p = self._weights_path()
+        return os.path.isfile(p) and os.path.getsize(p) > 0
 
     def _download_impl(self, models_dir: str, log_cb=None, progress_cb=None):
         if log_cb:

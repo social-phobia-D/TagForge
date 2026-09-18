@@ -84,7 +84,8 @@ class BatchWorker(QThread):
                     try:
                         res = eng.tag_image(
                             path, self.params_by_key.get(eng.key, {}), on_prog)
-                        self._merge(item, res, eng.key)
+                        self._merge(item, res, eng.key,
+                                    getattr(eng, "has_boxes", False))
                         path_ok = True
                     except Exception as e:
                         if not self._stop:  # 取消导致的报错不算失败，别刷日志
@@ -105,10 +106,12 @@ class BatchWorker(QThread):
             # （编辑器锁定不解除 → 删标签不落盘、画布不能选框）
             self.finished_all.emit(self.ok, self.fail, self._stop)
 
-    def _merge(self, item, res, eng_key):
+    def _merge(self, item, res, eng_key, has_boxes=False):
         """引擎结果只写自己的来源文件（<图名>.<来源>.txt），不与其他引擎混合"""
         black = self.blacklist
         new_tags = [t for t in res.tags if t.strip().lower() not in black]
+        new_boxes = [b for b in res.boxes
+                     if getattr(b, "label", "").strip().lower() not in black]
         if self.merge_mode == "replace":
             tags = list(self.trigger)
             for t in new_tags:
@@ -127,10 +130,12 @@ class BatchWorker(QThread):
             self.failed_one.emit(item.path, f"{eng_key}: {e}")
             return
         item.rebuild_merged()
-        if res.boxes:
-            item.boxes = res.boxes
+        if has_boxes:
+            # 每个检测引擎维护自己的框来源；空结果也要清除该引擎上一次的框，
+            # 否则重新打标后旧框会永久残留。画布仍显示所有来源的合并视图。
+            item.set_boxes_for_src(eng_key, new_boxes)
             from app.core.tag_writer import write_yolo_labels
             try:
-                write_yolo_labels(item.path, res.boxes)
-            except Exception:
-                pass
+                write_yolo_labels(item.path, item.boxes, item.boxes_by_src)
+            except Exception as e:
+                self.failed_one.emit(item.path, f"{eng_key}: {e}")

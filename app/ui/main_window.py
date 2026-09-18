@@ -7,7 +7,7 @@ from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDialog, QDockWidget, QDoubleSpinBox, QFileDialog,
     QFrame, QGridLayout, QGroupBox, QHBoxLayout, QInputDialog, QLabel,
     QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMessageBox,
-    QPlainTextEdit, QProgressBar, QPushButton, QSlider, QToolBar,
+    QPlainTextEdit, QProgressBar, QPushButton, QSlider, QSpinBox, QToolBar,
     QVBoxLayout, QWidget,
 )
 
@@ -58,6 +58,7 @@ class MainWindow(QMainWindow):
         self.store = ImageStore()
         self.engines = get_engines()
         self.thumb_worker = None
+        self._thumb_workers = []
         self.batch = None
         self._load_worker = None
         self._pending_loads = []
@@ -75,6 +76,8 @@ class MainWindow(QMainWindow):
         self._build_central()
         self._wire()
         self._build_statusbar()
+        # 初次构建后异步刷新一次，避免引擎状态标签一直为空，同时不阻塞窗口首帧。
+        QTimer.singleShot(0, self._refresh_engine_rows)
 
         last = self.settings.get_last_dir()
         if last and os.path.isdir(last):
@@ -313,12 +316,38 @@ class MainWindow(QMainWindow):
         self.param_widgets["yoloworld"] = [
             self.lbl_yolo_cls, self.yolo_classes, self.lbl_yolo_conf, self.yolo_conf]
 
+        self.lbl_la_classes = QLabel(tr("LocateAnything 类名(逗号分隔)"))
+        grid.addWidget(self.lbl_la_classes, 8, 0)
+        self.la_classes = QLineEdit()
+        self.la_classes.setPlaceholderText("person, car, dog …")
+        self.la_classes.setText(self.settings.get_la_classes())
+        grid.addWidget(self.la_classes, 8, 1, 1, 2)
+
         self.lbl_la_prompt = QLabel(tr("LocateAnything 提示词"))
-        grid.addWidget(self.lbl_la_prompt, 8, 0)
+        grid.addWidget(self.lbl_la_prompt, 9, 0)
         self.la_prompt = QLineEdit()
         self.la_prompt.setPlaceholderText(tr("留空 = 自动检测全部物体"))
-        grid.addWidget(self.la_prompt, 8, 1, 1, 2)
-        self.param_widgets["locateanything"] = [self.lbl_la_prompt, self.la_prompt]
+        grid.addWidget(self.la_prompt, 9, 1, 1, 2)
+
+        self.lbl_la_mode = QLabel(tr("LocateAnything 生成模式"))
+        grid.addWidget(self.lbl_la_mode, 10, 0)
+        self.la_mode = QComboBox()
+        self.la_mode.addItems([tr("混合模式（推荐）"), tr("快速模式"), tr("慢速模式")])
+        self.la_mode.setCurrentIndex(
+            {"hybrid": 0, "fast": 1, "slow": 2}.get(
+                self.settings.get_la_generation_mode(), 0))
+        grid.addWidget(self.la_mode, 10, 1, 1, 2)
+
+        self.lbl_la_tokens = QLabel(tr("最大生成 token"))
+        grid.addWidget(self.lbl_la_tokens, 11, 0)
+        self.la_tokens = QSpinBox()
+        self.la_tokens.setRange(128, 8192)
+        self.la_tokens.setSingleStep(128)
+        self.la_tokens.setValue(self.settings.get_la_max_new_tokens())
+        grid.addWidget(self.la_tokens, 11, 1)
+        self.param_widgets["locateanything"] = [
+            self.lbl_la_classes, self.la_classes, self.lbl_la_prompt, self.la_prompt,
+            self.lbl_la_mode, self.la_mode, self.lbl_la_tokens, self.la_tokens]
         eg.addLayout(grid)
         self._update_param_visibility()
         rv.addWidget(self.eng_box)
@@ -331,6 +360,8 @@ class MainWindow(QMainWindow):
         self.trigger_edit.setText(self.settings.get_trigger_word())
         self.merge_combo = QComboBox()
         self.merge_combo.addItems([tr("替换模式"), tr("追加模式")])
+        self.merge_combo.setCurrentIndex(
+            1 if self.settings.get_merge_mode() == "append" else 0)
         self.merge_combo.setToolTip(tr("替换：清空后写入新标签\n追加：保留原标签再合并"))
         act_row.addWidget(self.trigger_edit, 1)
         act_row.addWidget(self.merge_combo)
@@ -513,6 +544,11 @@ class MainWindow(QMainWindow):
         self.lbl_yolo_conf.setText(tr("YOLO 置信度"))
         self.lbl_la_prompt.setText(tr("LocateAnything 提示词"))
         self.la_prompt.setPlaceholderText(tr("留空 = 自动检测全部物体"))
+        self.lbl_la_classes.setText(tr("LocateAnything 类名(逗号分隔)"))
+        self.lbl_la_mode.setText(tr("LocateAnything 生成模式"))
+        for i, s in enumerate(("混合模式（推荐）", "快速模式", "慢速模式")):
+            self.la_mode.setItemText(i, tr(s))
+        self.lbl_la_tokens.setText(tr("最大生成 token"))
         self.lbl_trigger.setText(tr("触发词"))
         self.trigger_edit.setPlaceholderText(tr("如 mylora, style（逗号分隔，可空）"))
         self.merge_combo.setItemText(0, tr("替换模式"))
@@ -566,6 +602,12 @@ class MainWindow(QMainWindow):
         self.yolo_classes.editingFinished.connect(
             lambda: self.settings.set_yolo_classes(self.yolo_classes.text()))
         self.yolo_conf.valueChanged.connect(self.settings.set_yolo_conf)
+        self.la_classes.editingFinished.connect(
+            lambda: self.settings.set_la_classes(self.la_classes.text()))
+        self.la_mode.currentIndexChanged.connect(
+            lambda i: self.settings.set_la_generation_mode(
+                ("hybrid", "fast", "slow")[i]))
+        self.la_tokens.valueChanged.connect(self.settings.set_la_max_new_tokens)
         self.trigger_edit.editingFinished.connect(
             lambda: self.settings.set_trigger_word(self.trigger_edit.text()))
         self.merge_combo.currentIndexChanged.connect(
@@ -638,7 +680,10 @@ class MainWindow(QMainWindow):
             self.thumb_list.addItem(li)
             self._thumb_items[it.path] = li
         self._apply_thumb_mode()
-        self.thumb_worker = ThumbWorker([it.path for it in self.store.items])
+        self.thumb_worker = ThumbWorker([it.path for it in self.store.items], parent=self)
+        self._thumb_workers.append(self.thumb_worker)
+        worker = self.thumb_worker
+        worker.finished.connect(lambda w=worker: self._on_thumb_finished(w))
         self.thumb_worker.thumb_ready.connect(self._on_thumb_ready)
         self.thumb_worker.start()
         self.editor.set_item(None)
@@ -646,9 +691,20 @@ class MainWindow(QMainWindow):
         self.apply_filter()
 
     def _stop_thumb(self):
-        if self.thumb_worker:
-            self.thumb_worker.stop()
-            self.thumb_worker = None
+        workers = list(self._thumb_workers)
+        for worker in workers:
+            worker.stop()
+        for worker in workers:
+            if worker.isRunning():
+                worker.wait(5000)
+        self._thumb_workers = [w for w in self._thumb_workers if w.isRunning()]
+        self.thumb_worker = self._thumb_workers[-1] if self._thumb_workers else None
+
+    def _on_thumb_finished(self, worker):
+        if worker in self._thumb_workers and not worker.isRunning():
+            self._thumb_workers.remove(worker)
+            if worker is self.thumb_worker:
+                self.thumb_worker = self._thumb_workers[-1] if self._thumb_workers else None
 
     def _on_thumb_ready(self, path, image: QImage):
         li = self._thumb_items.get(path)
@@ -670,7 +726,9 @@ class MainWindow(QMainWindow):
                 vis = False
             if q:
                 vis = vis and (q in os.path.basename(path).lower() or
-                               any(q in t.lower() for t in item.tags))
+                               any(q in t.lower() for t in item.tags) or
+                               any(q in getattr(b, "label", "").lower()
+                                   for b in item.boxes))
             li.setHidden(not vis)
         self._update_count_label()
 
@@ -864,6 +922,10 @@ class MainWindow(QMainWindow):
             },
             "locateanything": {
                 "prompt": self.la_prompt.text().strip(),
+                "classes": self.la_classes.text().strip(),
+                "generation_mode": ("hybrid", "fast", "slow")[
+                    self.la_mode.currentIndex()],
+                "max_new_tokens": self.la_tokens.value(),
             },
         }
 
@@ -973,7 +1035,8 @@ class MainWindow(QMainWindow):
     def _on_image_done(self, path, tags, boxes):
         li = self._thumb_items.get(path)
         if li:
-            li.setToolTip(" , ".join(tags[:30]))
+            box_tags = [b.label for b in boxes if getattr(b, "label", "").strip()]
+            li.setToolTip(" , ".join((list(tags) + box_tags)[:30]))
         cur = self._selected_item()
         if cur and cur.path == path:
             self.editor.refresh_current()

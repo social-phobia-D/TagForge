@@ -97,3 +97,27 @@ class AppSettings:
 
     def set_yolo_conf(self, v: float):
         self.q.setValue("yolo/conf", v)
+
+    # --- LocateAnything ---
+    def get_la_classes(self) -> str:
+        return str(self.q.value("locateanything/classes", ""))
+
+    def set_la_classes(self, v: str):
+        self.q.setValue("locateanything/classes", v)
+
+    def get_la_generation_mode(self) -> str:
+        mode = str(self.q.value("locateanything/generation_mode", "hybrid"))
+        return mode if mode in {"fast", "slow", "hybrid"} else "hybrid"
+
+    def set_la_generation_mode(self, v: str):
+        self.q.setValue("locateanything/generation_mode", v)
+
+    def get_la_max_new_tokens(self) -> int:
+        try:
+            return max(128, min(8192, int(self.q.value(
+                "locateanything/max_new_tokens", 2048))))
+        except (TypeError, ValueError):
+            return 2048
+
+    def set_la_max_new_tokens(self, v: int):
+        self.q.setValue("locateanything/max_new_tokens", int(v))

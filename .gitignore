@@ -15,6 +15,7 @@ venv/
 # Runtime & model data — never commit
 models/
 runtime/
+_rt*/
 weights/
 hf_modules/
 .pipcache/

@@ -1,7 +1,8 @@
 import os
 import re
 
-from app.engines.base import EngineBase, EngineResult
+from app.engines.base import (EngineBase, EngineResult, hf_snapshot_path,
+                               hf_snapshot_ready)
 from app.engines.base import Box
 
 MODEL_ID = "nvidia/LocateAnything-3B"
@@ -12,7 +13,7 @@ class LocateAnythingEngine(EngineBase):
     title = "LocateAnything-3B 全自动物体标签 (NVIDIA)"
     description = "英伟达 3B 开放词表检测模型（并行出框解码）：可填类名做检测，也可免提示词自动找物体，输出物体标签+检测框。实测 int4 峰值显存约 5.5GB、单张约 3 秒。"
     vram_note = "int4 量化峰值约 5.5GB 显存；12GB+ 显卡可跑原精度更快"
-    pip_deps = ["torch", "transformers", "accelerate", "bitsandbytes", "einops", "safetensors", "peft", "eva-decord", "lmdb"]
+    pip_deps = ["torch", "transformers==4.57.1", "accelerate", "bitsandbytes", "einops", "safetensors", "peft", "eva-decord", "lmdb"]
     import_deps = ["torch", "transformers", "accelerate", "bitsandbytes", "einops", "safetensors", "peft", "decord", "lmdb"]
     weights_size = "约 7 GB"
     need_torch = True
@@ -26,10 +27,13 @@ class LocateAnythingEngine(EngineBase):
     def weights_ready(self) -> bool:
         cw = self.custom_weights()
         if cw:
-            return os.path.isfile(os.path.join(cw, "config.json"))
+            return (os.path.isdir(cw) and
+                    os.path.isfile(os.path.join(cw, "config.json")) and
+                    any(os.path.isfile(os.path.join(cw, name)) and
+                        name.lower().endswith((".safetensors", ".bin", ".pt"))
+                        for name in os.listdir(cw)))
         d = self._cache_dir()
-        return os.path.isdir(d) and any(
-            x.startswith("models--nvidia--LocateAnything-3B") for x in os.listdir(d))
+        return hf_snapshot_ready(MODEL_ID, d)
 
     def _download_impl(self, models_dir: str, log_cb=None, progress_cb=None):
         if log_cb:
@@ -44,8 +48,16 @@ class LocateAnythingEngine(EngineBase):
                 progress_cb(v)
 
         prog(3)
-        from app.engines._tcompat import patch_legacy_generation_attrs
+        from app.engines._tcompat import (patch_legacy_generation_attrs,
+                                          patch_attn_impl_kwargs,
+                                          patch_legacy_cache_indexing,
+                                          patch_legacy_rope_theta,
+                                          patch_legacy_tied_weights)
         patch_legacy_generation_attrs()
+        patch_attn_impl_kwargs()
+        patch_legacy_tied_weights()
+        patch_legacy_cache_indexing()
+        patch_legacy_rope_theta()
         import importlib
         if log_cb:
             log_cb("LocateAnything-3B: 导入 torch/transformers（首次约 10-20 秒）...")
@@ -55,8 +67,9 @@ class LocateAnythingEngine(EngineBase):
         self.torch = torch
 
         cw = (params or {}).get("custom_weights") or self.custom_weights()
-        src = cw or MODEL_ID
-        kw = {} if cw else {"cache_dir": self._cache_dir()}
+        cached = "" if cw else hf_snapshot_path(MODEL_ID, self._cache_dir())
+        src = cw or cached or MODEL_ID
+        kw = {} if (cw or cached) else {"cache_dir": self._cache_dir()}
 
         from app.core.gpu_check import gpu_info, pick_precision
         _name, vram = gpu_info()
@@ -79,11 +92,11 @@ class LocateAnythingEngine(EngineBase):
                         attn_implementation="sdpa",
                         quantization_config=BitsAndBytesConfig(
                             load_in_4bit=True,
-                            bnb_4bit_compute_dtype=torch.float16,
+                            bnb_4bit_compute_dtype=torch.bfloat16,
                             bnb_4bit_quant_type="nf4"),
                         device_map={"": 0})
                     self.device = "cuda"
-                    self.dtype = torch.float16
+                    self.dtype = torch.bfloat16
                 elif prec == "fp16":
                     self.model = transformers.AutoModel.from_pretrained(
                         src, trust_remote_code=True, **kw,
@@ -106,6 +119,7 @@ class LocateAnythingEngine(EngineBase):
                         cfg._attn_implementation = "sdpa"
                     if hasattr(m, "_attn_implementation"):
                         m._attn_implementation = "sdpa"
+                self._patch_legacy_runtime()
                 self.precision = prec
                 prog(80)
                 break
@@ -118,12 +132,39 @@ class LocateAnythingEngine(EngineBase):
             raise RuntimeError(f"LocateAnything-3B 所有加载方式均失败: {last_err}")
 
         prog(85)
-        self.tokenizer = transformers.AutoTokenizer.from_pretrained(
-            src, trust_remote_code=True, **kw)
+        # Transformers 5 warns that this Qwen tokenizer has the legacy Mistral
+        # regex; without the fix, chat-template tokenization can emit immediate
+        # EOS or unreadable text. Reuse the corrected tokenizer in the processor.
+        tokenizer_kw = dict(kw)
+        tokenizer_kw["fix_mistral_regex"] = True
+        try:
+            self.tokenizer = transformers.AutoTokenizer.from_pretrained(
+                src, trust_remote_code=True, **tokenizer_kw)
+        except TypeError:
+            self.tokenizer = transformers.AutoTokenizer.from_pretrained(
+                src, trust_remote_code=True, **kw)
         self.processor = transformers.AutoProcessor.from_pretrained(
             src, trust_remote_code=True, **kw)
+        if hasattr(self.processor, "tokenizer"):
+            self.processor.tokenizer = self.tokenizer
         if log_cb:
             log_cb(f"LocateAnything-3B: 加载完成（{self.precision}）")
+
+    def _patch_legacy_runtime(self):
+        # LocateAnything 的 checkpoint 只保存 Qwen2 输入嵌入，旧远程代码
+        # 依靠 tied weights 让输出头共享同一参数；显式绑定避免随机 head。
+        lm = getattr(self.model, "language_model", None)
+        if lm is None:
+            return
+        try:
+            inp = lm.get_input_embeddings()
+            out = lm.get_output_embeddings()
+        except AttributeError:
+            return
+        if (inp is not None and out is not None and
+                hasattr(inp, "weight") and hasattr(out, "weight") and
+                inp.weight.shape == out.weight.shape):
+            out.weight = inp.weight
 
     def _unload_impl(self):
         self.model = None
@@ -159,7 +200,7 @@ class LocateAnythingEngine(EngineBase):
                 max_new_tokens=max_new_tokens,
                 use_cache=True,
                 generation_mode=generation_mode,
-                # 官方 worker 默认采样参数：greedy 会让模型死循环重复同一个框
+                do_sample=True,
                 temperature=0.7,
                 top_p=0.9,
                 repetition_penalty=1.1,
@@ -212,7 +253,10 @@ class LocateAnythingEngine(EngineBase):
             if m.group(1) is not None:
                 current = m.group(1).strip()
                 continue
-            x1, y1, x2, y2 = [int(m.group(i)) for i in range(2, 6)]
+            x1, y1, x2, y2 = [max(0, min(1000, int(m.group(i))))
+                              for i in range(2, 6)]
+            x1, x2 = sorted((x1, x2))
+            y1, y2 = sorted((y1, y2))
             label = current or (cats[0] if cats else "object")
             if label and label not in result.tags:
                 result.tags.append(label)
@@ -228,8 +272,4 @@ class LocateAnythingEngine(EngineBase):
             text = re.sub(r"<[^>]*>", " ", answer).strip()
             if text:
                 result.tags.append(text[:200])
-        elif cats:
-            for c in cats:
-                if c not in result.tags:
-                    result.tags.append(c)
         return result

@@ -40,12 +40,14 @@ hand. **Every engine runs locally. No image is ever uploaded.**
 - **Four tagging engines, stackable** — tick any combination and batch-tag a
   whole folder in the background (progress bar, cancellable)
 - **Manual box annotation** — drag to draw, drag to move, corner handles to
-  resize, one label per box, YOLO-format files written on every change
+  resize, one label per box, YOLO-format files written on every change. Manual
+  and engine boxes are kept by source, so re-tagging does not overwrite them.
 - **Tag editor** — add/edit/reorder (drag & drop), autocomplete from the whole
   library, batch replace with regex, tag frequency stats, blacklist
 - **Bilingual UI** — Chinese / English, switch in the toolbar, applied instantly
 - **Export** — sidecar `.txt` (SD training format), CSV, YOLO boxes under
-  `labels/`
+  `labels/` (source metadata is stored in a matching `.sources.json`; the
+  standard YOLO aggregate file remains directly usable)
 
 ### Engines
 
@@ -160,11 +162,12 @@ TagForge 是一个桌面打标工作台，用于制作图像训练数据集（Lo
 - **四个打标引擎，可多选叠加** — 勾选任意组合，后台批量打标整个文件夹
   （进度条、可取消）
 - **手工画框标注** — 拖拽画框、点选拖动、角柄缩放，每框一个标签，修改即写
-  YOLO 格式文件
+  YOLO 格式文件。手工框与各引擎框按来源保留，重新打标不会互相覆盖
 - **标签编辑器** — 增删改、拖拽排序、全库自动补全、正则批量替换、标签频率
   统计、黑名单
 - **双语界面** — 中文 / English，工具栏右侧切换，即时生效
 - **导出** — 同名 `.txt`（SD 训练格式）、CSV、`labels/` 目录下的 YOLO 框
+  （框来源元数据保存在同名 `.sources.json`，标准 YOLO 总文件仍可直接使用）
 
 ### 引擎
 
@@ -200,6 +203,8 @@ python main.py
   - **自定义环境** — 填自己的 `python.exe` 路径（conda/venv 均可）点
     「验证」；选择此档即明确授权向该环境安装缺失依赖（已装过的包 pip
     自动跳过）。依赖齐全的自定义环境在默认档下也会被只读复用、零下载
+- Florence-2 与 LocateAnything-3B 需要 `transformers==4.57.1`；若检测到
+  其他版本，程序会提示补齐兼容依赖，避免模型“能加载但输出无效”
 - 然后 → 下载模型权重 → 加载
 
 权重与运行时默认保存在程序目录（`models/`、`runtime/`）；用工具栏

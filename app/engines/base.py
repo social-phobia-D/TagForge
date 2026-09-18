@@ -164,6 +164,44 @@ def hf_snapshot_download(repo_id: str, cache_dir: str, log_cb=None,
             progress_cb(100)
 
 
+def hf_snapshot_path(repo_id: str, cache_dir: str) -> str:
+    """返回 HF 缓存中完整可加载快照的本地路径；找不到则返回空串。"""
+    root = os.path.join(cache_dir, "models--" + repo_id.replace("/", "--"),
+                        "snapshots")
+    try:
+        repo_root = os.path.dirname(root)
+        candidates = []
+        ref = os.path.join(repo_root, "refs", "main")
+        if os.path.isfile(ref):
+            with open(ref, "r", encoding="utf-8") as f:
+                name = f.read().strip()
+            if name:
+                candidates.append(os.path.join(root, name))
+        candidates.extend(
+            os.path.join(root, name) for name in os.listdir(root)
+            if os.path.join(root, name) not in candidates)
+    except OSError:
+        return ""
+    model_exts = (".safetensors", ".bin", ".pt", ".onnx", ".gguf")
+    for snapshot in candidates:
+        if not os.path.isdir(snapshot) or not os.path.isfile(
+                os.path.join(snapshot, "config.json")):
+            continue
+        try:
+            if any(name.lower().endswith(model_exts)
+                   for _dir, _subdirs, names in os.walk(snapshot)
+                   for name in names):
+                return snapshot
+        except OSError:
+            continue
+    return ""
+
+
+def hf_snapshot_ready(repo_id: str, cache_dir: str) -> bool:
+    """检查 HF 缓存中是否存在完整的可加载快照，而不是仅检查目录名。"""
+    return bool(hf_snapshot_path(repo_id, cache_dir))
+
+
 @dataclass
 class Box:
     """检测框：像素坐标（原图尺寸）。放本模块保证 sidecar 无 Qt 环境可用"""
@@ -330,7 +368,20 @@ class EngineBase:
                 # sidecar 超时/崩溃后重建的进程是空白的，先恢复上次加载的模型
                 sc.load(self._last_params or params)
             r = sc.tag(path, params, progress_cb)
-            return EngineResult(tags=r.get("tags", []), boxes=r.get("boxes", []))
+            # sidecar 走 JSON，框被序列化成 dict（worker 里 b.__dict__）；
+            # 下游（标签编辑器 b.label / 写 YOLO 框文件）都按 Box 用，这里必须还原。
+            boxes = []
+            for b in r.get("boxes", []):
+                if isinstance(b, Box):
+                    boxes.append(b)
+                elif isinstance(b, dict):
+                    try:
+                        boxes.append(Box(**{k: b[k] for k in
+                                            ("label", "conf", "x1", "y1", "x2", "y2")
+                                            if k in b}))
+                    except Exception:
+                        pass
+            return EngineResult(tags=r.get("tags", []), boxes=boxes)
         r = self._tag_impl(path, params, progress_cb)
         if progress_cb:
             progress_cb(100)

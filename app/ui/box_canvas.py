@@ -78,6 +78,7 @@ class BoxCanvas(QLabel):
         self._zoom = 1.0
         self._off = None
         if it is not None:
+            it.ensure_box_sources()
             img = QImage(it.path)
             if not img.isNull():
                 self._img = img
@@ -104,7 +105,12 @@ class BoxCanvas(QLabel):
         if self._item is None or not self._boxes_visible:
             return
         if row >= 0:
-            self._sel = row if row < len(self._item.boxes) else -1
+            manual = self._item.boxes_by_src.get("manual", [])
+            target = manual[row] if row < len(manual) else None
+            try:
+                self._sel = self._item.boxes.index(target)
+            except ValueError:
+                self._sel = -1
         else:
             self._sel = -1
             for i, b in enumerate(self._item.boxes):
@@ -117,8 +123,9 @@ class BoxCanvas(QLabel):
         if self._boxes_visible and self._item and \
                 0 <= self._sel < len(self._item.boxes):
             b = self._item.boxes[self._sel]
-            self._undo.append(("del", self._sel, b))
-            del self._item.boxes[self._sel]
+            source = self._item.source_for_box(b)
+            self._undo.append(("del", self._sel, b, source))
+            self._item.remove_box(b)
             self._sel = -1
             self._save()
             self.update()
@@ -130,13 +137,14 @@ class BoxCanvas(QLabel):
         op = self._undo.pop()
         if self._item is None:
             return
-        kind, idx, payload = op
+        kind, idx, payload = op[:3]
         if kind == "add":
-            if 0 <= idx < len(self._item.boxes) and self._item.boxes[idx] is payload:
-                del self._item.boxes[idx]
+            self._item.remove_box(payload)
         elif kind == "del":
-            self._item.boxes.insert(min(idx, len(self._item.boxes)), payload)
-            self._sel = idx
+            source = op[3] if len(op) > 3 else "manual"
+            self._item.boxes_by_src.setdefault(source, []).append(payload)
+            self._item.rebuild_boxes()
+            self._sel = self._item.boxes.index(payload)
         elif kind == "set":
             b = self._item.boxes[idx] if 0 <= idx < len(self._item.boxes) else None
             if b is not None:
@@ -167,8 +175,10 @@ class BoxCanvas(QLabel):
             return -1
         b = self._item.boxes[self._sel]
         corners = [(b.x1, b.y1), (b.x2, b.y1), (b.x1, b.y2), (b.x2, b.y2)]
+        ox, oy, _ = self._map_geo()
         for i, (cx, cy) in enumerate(corners):
-            if abs(x - (cx * s)) <= HANDLE and abs(y - (cy * s)) <= HANDLE:
+            if abs(x - (ox + cx * s)) <= HANDLE and \
+                    abs(y - (oy + cy * s)) <= HANDLE:
                 return i
         return -1
 
@@ -256,7 +266,7 @@ class BoxCanvas(QLabel):
             if x2 - x1 > 4 and y2 - y1 > 4:  # 太小视为点击取消
                 label = (self.label_provider() or "object").strip() or "object"
                 box = Box(label=label, conf=1.0, x1=x1, y1=y1, x2=x2, y2=y2)
-                self._item.boxes.append(box)
+                self._item.add_box(box, "manual")
                 self._sel = len(self._item.boxes) - 1
                 self._undo.append(("add", self._sel, box))
                 self._save()
@@ -346,7 +356,9 @@ class BoxCanvas(QLabel):
         if self._item is None:
             return
         try:
-            write_yolo_labels(self._item.path, self._item.boxes)
+            self._item.ensure_box_sources()
+            write_yolo_labels(self._item.path, self._item.boxes,
+                              self._item.boxes_by_src)
         except Exception:
             pass
         self.boxes_changed.emit()
