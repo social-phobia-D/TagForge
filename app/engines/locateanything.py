@@ -69,7 +69,10 @@ class LocateAnythingEngine(EngineBase):
         cw = (params or {}).get("custom_weights") or self.custom_weights()
         cached = "" if cw else hf_snapshot_path(MODEL_ID, self._cache_dir())
         src = cw or cached or MODEL_ID
-        kw = {} if (cw or cached) else {"cache_dir": self._cache_dir()}
+        # 自定义目录和已存在的本地快照必须完全离线加载，避免
+        # Transformers 在网络受限时仍向 Hugging Face 发 HEAD 请求。
+        kw = ({"local_files_only": True} if (cw or cached)
+              else {"cache_dir": self._cache_dir()})
 
         from app.core.gpu_check import gpu_info, pick_precision
         _name, vram = gpu_info()

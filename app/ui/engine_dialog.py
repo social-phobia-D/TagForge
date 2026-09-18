@@ -235,6 +235,8 @@ class EngineDialog(QDialog):
         q = QSettings("Dabiao", "dabiao")
         os.environ.setdefault("DABIAO_INSTALL_TARGET",
                               str(q.value("general/install_target", "runtime")))
+        saved_python = str(q.value("general/custom_python", "") or "").strip()
+        os.environ.setdefault("DABIAO_SIDECAR_PYTHON", saved_python)
 
         # 安装目标：程序自带运行时 / 自定义环境
         tgt_row = QHBoxLayout()
