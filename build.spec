@@ -42,7 +42,10 @@ a = Analysis(
 
 # excludes 只能拦 Python 模块，PySide6 hook 捆绑的 Qt DLL 需在这里过滤。
 # 保留 opengl32sw.dll 作为无 GL 驱动环境的软渲染兜底。
-_DROP_DLLS = ('Qt6Pdf', 'Qt6Quick', 'Qt6Qml', 'Qt6QuickWidgets', 'Qt6Charts')
+_DROP_DLLS = ('Qt6Pdf', 'Qt6Quick', 'Qt6Qml', 'Qt6QuickWidgets', 'Qt6Charts',
+               # PyInstaller 可能从构建环境收集不兼容的 ICU 78，
+               # 当前 PySide6 的 Qt6Core 需要系统提供的未加版本后缀 ICU API。
+               'icuuc.dll', 'icudt')
 a.binaries = [b for b in a.binaries
               if not any(d in b[0] for d in _DROP_DLLS)]
 pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
