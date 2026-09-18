@@ -17,6 +17,23 @@
 
 </div>
 
+## 下载与启动
+
+### Windows 便携版
+
+[下载最新 Windows 版 TagForge_win64.zip](TagForge_win64.zip)
+
+1. 下载并解压完整压缩包。
+2. 打开解压后的 `TagForge/` 文件夹。
+3. 双击 `TagForge.exe` 启动。
+
+> 必须保留 `TagForge.exe` 旁边的 `_internal/` 文件夹，不能只复制 EXE。
+> 如果出现 `QtGui` 或其他 DLL 加载错误，请用最新压缩包整体替换旧的 `TagForge/` 文件夹。
+
+### 源码运行
+
+请继续阅读下面的 English / 简体中文说明，或直接参考源码安装步骤。
+
 ---
 
 <a id="english"></a>
