@@ -110,6 +110,26 @@ images/
 
 此外可从界面导出 CSV。标准 YOLO 文件保持可直接用于常见训练工具，来源元数据单独保存，便于后续复核和重新推理。
 
+## 导出可训练的 YOLO 数据集
+
+如果当前图片已经通过 Florence-2、YOLO-World、LocateAnything-3B 或手工画框生成了检测框，可以使用工具栏中的两个按钮：
+
+1. **划分训练/验证集**：选择一个空的外部目录，按比例复制图片和框标注，生成 `images/train`、`images/val`、`labels/train`、`labels/val` 和根目录 `classes.txt`。原始图片目录不会被修改。
+2. **生成 `data.yaml`**：选择刚才的数据集目录，程序读取 `classes.txt` 并生成 Ultralytics 可用的 `data.yaml`。
+
+最终目录类似：
+
+```text
+my_dataset/
+├─ data.yaml
+├─ classes.txt
+├─ images/train/
+├─ images/val/
+├─ labels/train/
+└─ labels/val/
+```
+
+只有带检测框的引擎结果会进入 YOLO 标签；WD14 的图像级标签仍保存在对应的标签文本文件中，不会被当作检测框导出。
 ## 手工标注快捷键
 
 | 按键 | 功能 |

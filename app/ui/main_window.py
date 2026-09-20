@@ -18,6 +18,10 @@ from app.core.image_store import ImageStore
 from app.ui.box_canvas import BoxCanvas
 from app.core.settings import AppSettings
 from app.core.tag_writer import export_csv
+from app.core.yolo_dataset import (
+    class_names_from_items, read_class_names, split_yolo_dataset,
+    write_data_yaml,
+)
 from app.engines.base import get_engines
 from app.ui.engine_dialog import EngineDialog
 from app.ui.tag_editor import TagEditor
@@ -129,13 +133,22 @@ class MainWindow(QMainWindow):
         a_csv.triggered.connect(self._export_csv)
         tb.addAction(a_csv)
 
+        a_yaml = QAction(tr("生成 data.yaml"), self)
+        a_yaml.triggered.connect(self._generate_data_yaml)
+        tb.addAction(a_yaml)
+
+        a_split = QAction(tr("划分训练/验证集"), self)
+        a_split.triggered.connect(self._split_yolo_dataset)
+        tb.addAction(a_split)
+
         a_data = QAction(tr("数据目录"), self)
         if ic_data:
             a_data.setIcon(ic_data.icon())
         a_data.triggered.connect(self._choose_data_dir)
         tb.addAction(a_data)
         self.a_open, self.a_refresh = a_open, a_refresh
-        self.a_engines, self.a_csv, self.a_data = a_engines, a_csv, a_data
+        self.a_engines, self.a_csv = a_engines, a_csv
+        self.a_yaml, self.a_split, self.a_data = a_yaml, a_split, a_data
 
     def _choose_data_dir(self):
         cur = os.environ.get("DABIAO_DATA_DIR") or ""
@@ -518,6 +531,8 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(tr("TagForge · 打标工坊"))
         for a, s in ((self.a_open, "打开文件夹"), (self.a_refresh, "刷新"),
                      (self.a_engines, "引擎管理"), (self.a_csv, "导出CSV"),
+                     (self.a_yaml, "生成 data.yaml"),
+                     (self.a_split, "划分训练/验证集"),
                      (self.a_data, "数据目录")):
             a.setText(tr(s))
         self.chk_recursive.setText(tr("包含子文件夹"))
@@ -1117,6 +1132,77 @@ class MainWindow(QMainWindow):
         if out:
             export_csv(self.store.items, out)
             self.status_msg.setText(tr("已导出 {0}").format(out))
+
+    def _generate_data_yaml(self):
+        if not self.store.items:
+            QMessageBox.information(self, tr("提示"), tr("请先打开文件夹"))
+            return
+        default_path = os.path.join(self.store.folder, "data.yaml")
+        out, _ = QFileDialog.getSaveFileName(
+            self, tr("选择 data.yaml 保存位置"), default_path,
+            "YAML (*.yaml *.yml)")
+        if not out:
+            return
+        root = os.path.dirname(os.path.abspath(out))
+        names = []
+        for candidate in (os.path.join(root, "classes.txt"),
+                          os.path.join(root, "labels", "classes.txt")):
+            names = read_class_names(candidate)
+            if names:
+                break
+        if not names:
+            names = class_names_from_items(self.store.items)
+        if not names:
+            raw, ok = QInputDialog.getText(
+                self, tr("输入 YOLO 类别"),
+                tr("请输入类别名称，使用英文逗号分隔"), "")
+            if not ok:
+                return
+            names = [part.strip() for part in raw.split(",") if part.strip()]
+        if not names:
+            QMessageBox.warning(self, tr("错误"), tr("至少需要一个检测类别"))
+            return
+        try:
+            write_data_yaml(root, names, out)
+        except Exception as e:
+            QMessageBox.critical(
+                self, tr("错误"), tr("生成 data.yaml 失败：{0}").format(e))
+            return
+        QMessageBox.information(
+            self, tr("完成"),
+            tr("已生成 data.yaml：\n{0}\n类别数：{1}").format(
+                out, len(names)))
+
+    def _split_yolo_dataset(self):
+        if not self.store.items:
+            QMessageBox.information(self, tr("提示"), tr("请先打开文件夹"))
+            return
+        ratio, ok = QInputDialog.getDouble(
+            self, tr("划分训练/验证集"), tr("训练集比例（0.1 - 0.99）"),
+            0.8, 0.1, 0.99, 2)
+        if not ok:
+            return
+        output = QFileDialog.getExistingDirectory(
+            self, tr("选择 YOLO 数据集输出目录"), self.store.folder)
+        if not output:
+            return
+        try:
+            result = split_yolo_dataset(
+                self.store.items, self.store.folder, output, ratio)
+        except FileExistsError:
+            QMessageBox.warning(
+                self, tr("提示"),
+                tr("输出目录必须为空，以避免覆盖已有数据集"))
+            return
+        except Exception as e:
+            QMessageBox.critical(
+                self, tr("错误"), tr("划分数据集失败：{0}").format(e))
+            return
+        QMessageBox.information(
+            self, tr("完成"),
+            tr("YOLO 数据集划分完成：\n{0}\n训练集：{1} 张\n验证集：{2} 张\n类别数：{3}\n请再点击“生成 data.yaml”。").format(
+                result["output"], result["train"], result["val"],
+                len(result["classes"])))
 
     # 拖拽文件夹
     def dragEnterEvent(self, e):
