@@ -11,9 +11,13 @@ import time
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
-os.environ.setdefault("DABIAO_DATA_DIR", r"F:\dabiao")
-os.environ["DABIAO_SIDECAR_PYTHON"] = os.environ.get(
-    "DABIAO_SIDECAR_PYTHON", r"E:\Anaconda3\envs\yolo1\python.exe")
+# Keep test paths machine-independent. Override these environment variables
+# when the test needs a dedicated model/runtime environment.
+os.environ.setdefault(
+    "DABIAO_DATA_DIR",
+    os.path.abspath(os.environ.get("TAGFORGE_TEST_DATA_DIR", "test_dataset")),
+)
+os.environ.setdefault("DABIAO_SIDECAR_PYTHON", sys.executable)
 os.environ["DABIAO_INSTALL_TARGET"] = "custom"
 
 import app.engines.base as base
